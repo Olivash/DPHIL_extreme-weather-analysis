@@ -1,57 +1,92 @@
-# Variance Decomposition Analysis
+# Variance decomposition: reforecast intrinsic vs ERA5 variance
 
-This analysis decomposes reforecast temperature variance into total, intrinsic, and ERA5 components across forecast lead day, for the Pacific Northwest extreme-heat case study. It supports the lead-time justification (day 12) used in the *Journal of Climate* paper and the corresponding thesis chapter.
+This directory contains the pipeline used to compute and visualise the variance
+decomposition of ECMWF reforecast ensemble members against ERA5 observations,
+covering the medium range (lead days 0 to 13) and the sub seasonal to seasonal
+(S2S) extension (lead days 15 to 40), for the 2021 Pacific Northwest heatwave
+attribution analysis.
 
-## Data
+## Contents
 
-The working dataframe `df` is a long-format table with one row per (inidate, number, hDate, lead day) combination:
+### `scripts/01_compute_variance.py`
 
-| column | meaning |
-|---|---|
-| `inidate` | forecast initialisation date |
-| `number` | ensemble member index |
-| `hDate` | hindcast year (2001–2020) |
-| `t2m` | reforecast 2m temperature (°C) |
-| `days` | lead day (0–13) |
-| `forecast_date` | actual calendar date being verified, `base_date + days` |
-| `t2m_era5` | ERA5 observed 2m temperature for `forecast_date`, merged in by date |
+Loads the ERA5 reference dataset and both reforecast datasets (medium range and
+S2S), merges them by valid date, and computes total variance, intrinsic
+variance, and ERA5 variance for each forecast lead day.
 
-Currently spans 11 inidates × 11 members × 20 hDates × 14 lead days = 33,880 rows.
+Intrinsic variance isolates the within ensemble (chaotic, unpredictable)
+component of forecast spread by removing the ensemble mean signal and adding
+back daily climatology.
 
-## Variance decomposition
+Output: `variance_summary_all.csv`
 
-For each lead day:
+### `scripts/02_plot_final_figure.py`
 
-```python
-df['ensemble_mean'] = df.groupby(['inidate', 'hDate', 'days'])['t2m'].transform('mean')
-df['climatology']   = df.groupby(['days'])['t2m'].transform('mean')
-df['intrinsic']     = df['t2m'] - df['ensemble_mean'] + df['climatology']
+Produces the publication figure showing intrinsic and ERA5 variance by lead
+day, with the intrinsic/ERA5 ratio on a secondary axis and the ERA5
+convergence day annotated.
 
-var_total_per_day     = df.groupby('days')['t2m'].var()
-var_intrinsic_per_day  = df.groupby('days')['intrinsic'].var()
+### `scripts/03_plot_figures.py`
+
+Produces two further diagnostic figures from the same `variance_summary_all.csv`:
+
+1. A twin axis figure showing total and intrinsic variance alongside the
+   intrinsic/total ratio, with the internal saturation day annotated.
+2. A two panel figure showing variance (top) and all three ratios (bottom):
+   total/ERA5, intrinsic/ERA5, and intrinsic/total.
+
+This script also determines two distinct lead day criteria automatically,
+rather than relying on a fixed, manually chosen day. These answer two
+different scientific questions and should not be conflated:
+
+**Internal saturation day** (`find_internal_saturation_day`)
+The first lead day at which the intrinsic/total ratio settles within 5
+percent of its own long lead plateau (estimated from the mean of the last 10
+lead days) and stays there for 3 consecutive lead days. This ratio has no
+reason to converge to 1, since intrinsic variance is always some fraction of
+total variance by construction. Convergence is therefore defined relative to
+the series' own plateau, not to a fixed target.
+
+**ERA5 convergence day** (`find_era5_convergence_day`)
+The first lead day at which the intrinsic/ERA5 ratio reaches 0.95. Unlike the
+saturation day, this is a genuine threshold crossing: a ratio of 1 is the
+exact point where intrinsic variance equals ERA5's observed variance, so this
+criterion answers whether the reforecast's internal spread has caught up to
+real world variability.
+
+The ERA5 convergence day is the one relevant to the lead time justification in
+the JoC paper (day 12, ratio 0.973, on the current dataset).
+
+## Requirements
+
+```
+numpy
+pandas
+xarray
+matplotlib
 ```
 
-`ensemble_mean` strips out the within-(inidate, hDate) forced signal, leaving pure within-ensemble (chaotic) spread. `climatology` adds back a single reference value so the result sits on a physical temperature scale rather than as an anomaly, without altering the variance, since adding any constant to a set of values never changes its variance.
+## Usage
 
-**Important: `climatology` must stay a single value per lead day (grouped only by `days`), not grouped by `inidate` or `number`.** Letting it vary by `inidate` reintroduces the seasonal cycle (June dates run cooler than July dates) into what's supposed to be pure chaos variance, inflating intrinsic variance for the wrong reason. Letting it vary by `number` assumes ensemble members carry a consistent identity across different inidates, which isn't generally true for independently-generated reforecast perturbations. Both were tried and reverted during development; keep the single-value version.
+Run in this order, from the same working directory:
 
-## ERA5 comparison
-
-ERA5 has no ensemble dimension, so it must be deduplicated across `number` before computing variance, otherwise each value is counted 11 times:
-
-```python
-era5_unique = df.drop_duplicates(subset=['inidate', 'hDate', 'days'])
-var_era5_per_day = era5_unique.groupby('days')['t2m_era5'].var()
+```
+python scripts/01_compute_variance.py
+python scripts/02_plot_final_figure.py
+python scripts/03_plot_figures.py
 ```
 
-Two ERA5 reference framings are used: the per-lead-day "varying" version above, and a single "fixed" reference (`var_era5_per_day.loc[12]`) anchored to the day-12 verification window specifically, used for the headline day-12 ratio claims since it isolates the actual target verification dates without conflating them with other lead days' calendar windows.
+Both plotting scripts read `variance_summary_all.csv`, produced by the first
+script.
 
-## Outputs
+## Data paths
 
-- `variance_decomposition_final.png` — two-panel figure: (a) total/intrinsic variance with ERA5 reference line, (b) intrinsic/total and intrinsic/ERA5 ratios, both vs lead day, with day-12 marked.
-- `hist_day12.png` / `.pdf` — single-panel histogram comparing reforecast, intrinsic, and ERA5 (×11 weighted) distributions at lead day 12.
-- `hist_all_leaddays.png` / `.pdf` — same histogram comparison gridded across all 14 lead days.
+The ERA5 and reforecast file paths at the top of `01_compute_variance.py`
+point to the AOPP HPC cluster (`/network/group/aopp/predict/...`). Update
+these paths if running elsewhere.
 
-## Status
+## Figure conventions
 
-At lead day 12, intrinsic/total ≈ 0.5 and intrinsic/ERA5 ≈ 0.6–0.7, neither has reached 1. This differs from the original single-inidate JOC analysis, which found ratios closer to saturation by day 12. Before finalising the day-12 justification using this pooled, multi-inidate version, the original single-inidate case should be rerun with the same single-value climatology to check whether the discrepancy comes from pooling across inidates, or from the climatology formula used in the original analysis.
+All figures follow AMS/AGU style: serif font, no in-image titles, 600 dpi PDF
+and PNG output, x-ticks every 5 lead days, Wong/Okabe-Ito colourblind safe
+palette.
