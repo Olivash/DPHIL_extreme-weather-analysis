@@ -71,9 +71,9 @@ matplotlib
 Run in this order, from the same working directory:
 
 ```
-python scripts/01_compute_variance.py
-python scripts/02_plot_final_figure.py
-python scripts/03_plot_figures.py
+python scripts/compute_variance.py
+python scripts/plot_variance_figures.py
+python scripts/plot_variance_figures_2.py
 ```
 
 Both plotting scripts read `variance_summary_all.csv`, produced by the first
