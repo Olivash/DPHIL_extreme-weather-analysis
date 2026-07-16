@@ -1,5 +1,7 @@
 # Reforecast Processing Pipeline
 
+########### RUN ON XESMF-ENV#######################
+
 This repository contains scripts for processing ECMWF reforecast GRIB files into Zarr stores for:
 - 2 m temperature (`t2m`)
 - total precipitation (`tp`)
@@ -24,8 +26,8 @@ The workflow:
 - `merge_reforecast_parts.py`  
   Merges part Zarr stores into a final dataset, if you want a single store at the end.
 
-- `reforecast_part.slurm`  
-  Example SLURM job array submission script.
+- `build_reforecast_part.sh`  
+  SLURM job array submission script.
 
 - `merge_reforecast.slurm`  
   Example merge job submission script.
