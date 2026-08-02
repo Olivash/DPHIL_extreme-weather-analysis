@@ -213,6 +213,14 @@ def fitted_return_levels(fit: dict, return_periods: np.ndarray) -> np.ndarray:
     return np.where(q < 1, x, np.nan)
 
 
+def return_period_for_value(fit: dict, x: float) -> float:
+    """Invert fitted_return_levels: the Gumbel-fit return period implied by value x."""
+    q = 1 - gumbel_r.cdf(x, loc=fit["loc"], scale=fit["scale"])  # P(X > x)
+    if q <= 0:
+        return np.inf
+    return 1.0 / (fit["rate"] * q)
+
+
 def bootstrap_return_level_ci(
     values: np.ndarray,
     n_years: int,
@@ -256,7 +264,16 @@ def bootstrap_return_level_ci(
 
 
 def plot_return_periods(
-    fit_era5: dict, fit_rf: dict, era5_values: np.ndarray, rf_values: np.ndarray, lead_day: int
+    fit_era5: dict,
+    fit_rf: dict,
+    era5_values: np.ndarray,
+    rf_values: np.ndarray,
+    lead_day: int,
+    fit_era5_sensitivity: dict = None,
+    era5_sensitivity_values: np.ndarray = None,
+    sensitivity_label: str = None,
+    reference_value: float = None,
+    reference_label: str = None,
 ):
     """
     Return-period plot for both datasets: empirical (plotting-position)
@@ -264,18 +281,47 @@ def plot_return_periods(
     era5_values / rf_values are the full pooled arrays (not just the
     exceedances) since the bootstrap re-selects its own threshold on
     each resample.
-    """
-    fig, ax = plt.subplots(figsize=(7.2, 4.8))
-    T_fit = RETURN_PERIODS_PLOT
 
-    for fit, values, key in (
-        (fit_era5, era5_values, "era5"),
-        (fit_rf, rf_values, "reforecast"),
-    ):
+    fit_era5_sensitivity (optional): a second ERA5 fit -- e.g. with its
+    single most extreme point dropped -- drawn as a dotted overlay so the
+    two ERA5 curves can be compared directly for sensitivity to that point.
+
+    reference_value (optional): draws a horizontal line (e.g. the 2021 PNW
+    heatwave's observed peak) and marks/annotates the return period each
+    fitted curve implies for it.
+    """
+    curves = [(fit_era5, era5_values, "era5", COL["era5"], "-", "ERA5")]
+    if fit_era5_sensitivity is not None:
+        curves.append(
+            (fit_era5_sensitivity, era5_sensitivity_values, "era5", "#555555", ":",
+             sensitivity_label or "ERA5 (sensitivity)")
+        )
+    curves.append(
+        (fit_rf, rf_values, "reforecast", COL["reforecast"], "--", f"Reforecast day {lead_day}")
+    )
+
+    # Extend the return-period axis far enough to show the *nearest* curve's
+    # crossing of reference_value on-chart (curves that stay far more
+    # extreme, e.g. ERA5 vs. an unprecedented heatwave, are reported in the
+    # summary box below instead of stretching the axis by orders of
+    # magnitude to reach them).
+    T_max_plot = RETURN_PERIODS_PLOT.max()
+    if reference_value is not None:
+        finite_T_ref = [
+            return_period_for_value(fit, reference_value) for fit, *_ in curves
+        ]
+        finite_T_ref = [t for t in finite_T_ref if np.isfinite(t)]
+        if finite_T_ref:
+            T_max_plot = max(T_max_plot, min(min(finite_T_ref) * 3, 1e6))
+    T_fit = np.logspace(0, np.log10(T_max_plot), 400)
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+
+    for fit, values, ci_key, color, _, _ in curves:
         lower, upper = bootstrap_return_level_ci(
             values, fit["n_years"], fit["n_members"], fit["rate_mode"], T_fit
         )
-        ax.fill_between(T_fit, lower, upper, color=COL[key], alpha=0.15, linewidth=0, zorder=1)
+        ax.fill_between(T_fit, lower, upper, color=color, alpha=0.12, linewidth=0, zorder=1)
 
     T_emp_era5, x_emp_era5 = empirical_return_periods(fit_era5)
     T_emp_rf, x_emp_rf = empirical_return_periods(fit_rf)
@@ -289,23 +335,49 @@ def plot_return_periods(
         label=f"Reforecast day {lead_day} (empirical)", zorder=2,
     )
 
-    ax.plot(
-        T_fit, fitted_return_levels(fit_era5, T_fit), color=COL["era5"],
-        linewidth=1.4, label="ERA5 (Gumbel fit)", zorder=4,
-    )
-    ax.plot(
-        T_fit, fitted_return_levels(fit_rf, T_fit), color=COL["reforecast"],
-        linewidth=1.4, linestyle="--", label=f"Reforecast day {lead_day} (Gumbel fit)", zorder=4,
-    )
-    ax.plot([], [], color=COL["reference"], alpha=0.3, linewidth=8,
+    for fit, _, _, color, linestyle, label in curves:
+        ax.plot(
+            T_fit, fitted_return_levels(fit, T_fit), color=color,
+            linewidth=1.4, linestyle=linestyle, label=f"{label} (Gumbel fit)", zorder=4,
+        )
+    ax.plot([], [], color=COL["reference"], alpha=0.25, linewidth=8,
             label=f"{int(CI_LEVEL * 100)}% bootstrap CI")
+
+    if reference_value is not None:
+        ax.axhline(reference_value, color=COL["reference"], linewidth=1, linestyle="-.", zorder=5)
+        ax.text(
+            T_fit.max() * 0.7, reference_value, reference_label or f"{reference_value:g}",
+            fontsize=8, color=COL["reference"], va="bottom", ha="right",
+        )
+
+        ref_desc = reference_label or f"{reference_value:g}"
+        lines = [f"Return period implied by {ref_desc}:"]
+        for fit, _, _, color, _, label in curves:
+            T_ref = return_period_for_value(fit, reference_value)
+            if np.isfinite(T_ref) and T_ref <= T_fit.max():
+                ax.scatter([T_ref], [reference_value], color=color, marker="x", s=45, zorder=6)
+                lines.append(f"{label}: {T_ref:,.0f} yr")
+            elif np.isfinite(T_ref):
+                lines.append(f"{label}: {T_ref:,.0f} yr (off-chart)")
+            else:
+                lines.append(f"{label}: never (beyond fit's upper support)")
+        ax.text(
+            0.98, 0.03, "\n".join(lines), transform=ax.transAxes,
+            fontsize=7, color=COL["reference"], ha="right", va="bottom",
+            bbox=dict(boxstyle="round", facecolor="white", edgecolor="0.7", alpha=0.9),
+        )
 
     ax.set_xscale("log")
     ax.set_xlabel("Return period (years)")
     ax.set_ylabel(r"t2m ($^\circ$C)")
+    if reference_value is not None:
+        ax.set_ylim(top=max(ax.get_ylim()[1], reference_value + 1))
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.legend(frameon=False, loc="upper left")
+    ax.legend(
+        frameon=True, facecolor="white", edgecolor="none", framealpha=0.85,
+        loc="upper left", fontsize=7,
+    )
     fig.tight_layout()
     return fig
 
@@ -335,6 +407,16 @@ def parse_args():
         "--rate-mode", default=RATE_MODE, choices=["unseen", "per_calendar_year"]
     )
     p.add_argument("--out-prefix", default=None, help="directory/prefix for outputs")
+    p.add_argument(
+        "--drop-era5-max", action="store_true",
+        help="also fit ERA5 with its single highest value removed, overlaid for comparison",
+    )
+    p.add_argument(
+        "--reference-value", type=float, default=None,
+        help="draw a horizontal line at this value and report the return period each "
+             "fitted curve implies for it (e.g. 39.5 for the 2021 PNW heatwave peak)",
+    )
+    p.add_argument("--reference-label", default=None)
     return p.parse_args()
 
 
@@ -359,15 +441,40 @@ def main():
         rf_values, n_years_rf, n_members=n_members_rf, rate_mode=args.rate_mode
     )
 
-    summary = pd.DataFrame(
-        [summarize("era5", fit_era5), summarize(f"reforecast_day{args.lead_day}", fit_rf)]
-    )
+    summaries = [summarize("era5", fit_era5), summarize(f"reforecast_day{args.lead_day}", fit_rf)]
+
+    fit_era5_sens, era5_sens_values, sens_label = None, None, None
+    if args.drop_era5_max:
+        drop_idx = np.argmax(era5_values)
+        dropped_value = era5_values[drop_idx]
+        era5_sens_values = np.delete(era5_values, drop_idx)
+        fit_era5_sens = fit_pot_gumbel(era5_sens_values, n_years_era5)
+        sens_label = "ERA5 (excl. max)"
+        summaries.append(summarize("era5_excl_max", fit_era5_sens))
+        print(f"Dropped ERA5 max: {dropped_value:.3f} (of {len(era5_values)} points)")
+
+    summary = pd.DataFrame(summaries)
     summary.to_csv(out_csv, index=False)
     print(f"ERA5: n={len(era5_df)} over {n_years_era5} yr, {len(target_mmdd)} dates/yr")
     print(f"Reforecast: n={len(rf_df)} over {n_years_rf} yr, {n_members_rf} members")
     print(summary.to_string(index=False))
 
-    fig = plot_return_periods(fit_era5, fit_rf, era5_values, rf_values, args.lead_day)
+    if args.reference_value is not None:
+        curves = [("ERA5", fit_era5)]
+        if fit_era5_sens is not None:
+            curves.append((sens_label, fit_era5_sens))
+        curves.append((f"Reforecast day {args.lead_day}", fit_rf))
+        print(f"\nReturn period implied by {args.reference_value:g}:")
+        for label, fit in curves:
+            T_ref = return_period_for_value(fit, args.reference_value)
+            print(f"  {label}: {T_ref:,.1f} yr" if np.isfinite(T_ref) else f"  {label}: never (below fit support)")
+
+    fig = plot_return_periods(
+        fit_era5, fit_rf, era5_values, rf_values, args.lead_day,
+        fit_era5_sensitivity=fit_era5_sens, era5_sensitivity_values=era5_sens_values,
+        sensitivity_label=sens_label,
+        reference_value=args.reference_value, reference_label=args.reference_label,
+    )
     fig.savefig(f"{out_base}.pdf")
     fig.savefig(f"{out_base}.png")
     print(f"\nSaved -> {out_csv}, {out_base}.pdf, {out_base}.png")
