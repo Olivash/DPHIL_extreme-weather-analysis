@@ -49,6 +49,41 @@ the textbook peaks-over-threshold model: a generalized Pareto to the
 threshold exceedances (values - threshold), which is the distribution
 POT theory actually motivates. See fit_pot.
 
+Reforecast bias correction (--recompute-lead-bias, compute_lead_bias)
+-----------------------------------------------------------------------
+The bias-corrected column originally shipped in the reforecast csv
+(REFORECAST_VALUE_COL default, "adjusted_t2m") was verified to be
+computed incorrectly for this analysis: it comes from a linear
+regression of ERA5 against the reforecast's *lead day 0* ensemble mean
+(intercept only, slope discarded), then applied uniformly to every lead
+day including 12. Two problems, found by tracing the exact code that
+produced it: (1) it's a lead-0 bias applied to lead-12 data, and lead-day
+bias is not obviously stable -- the entire reason lead day 12 was chosen
+elsewhere in this project is that the ensemble's statistics *change*
+with lead time; (2) at lead day 12 specifically, the ERA5-vs-model
+regression this bias comes from is very weak (checked: r as low as 0.12,
+slope as low as 0.07), so a regression intercept isn't a meaningful bias
+at all -- it's an artifact of extrapolating a near-flat line. On the
+verified data this pushed the reforecast curve up by 1-2 degC across the
+whole tail, changing the 39.5 degC crossing from ~84,000 to ~141,000
+years once fixed.
+
+compute_lead_bias() instead computes a plain mean-climatology difference
+(model mean - ERA5 mean, both evaluated at the correct lead day and
+calendar date) per inidate, robust regardless of correlation strength.
+Pass --recompute-lead-bias to use it instead of REFORECAST_VALUE_COL.
+
+Empirical tail-slope cross-check (empirical_tail_slope, --empirical-slope-plot)
+---------------------------------------------------------------------------------
+A second, fully distribution-free cross-check on the POT Gumbel/GPD fit:
+linear regression of ln P(X > x | X > threshold) against magnitude x,
+using the top 5% points directly (Weibull plotting position), no
+Gumbel/GPD assumption at all. The slope translates into a multiplicative
+factor: each +1 degree multiplies the within-tail exceedance probability
+by exp(slope). MODEL_COLORS/plot_empirical_slopes are written to take an
+arbitrary list of named datasets, so additional models (e.g. CMIP) can be
+added without restructuring -- see plot_empirical_slopes' docstring.
+
 Inputs
 ------
 ERA5_PATH   NetCDF with a `time` coordinate and a `t2m` variable (daily,
@@ -113,6 +148,19 @@ COL = {
 }
 GRID_COLOR = "#d3d3d3"
 
+# tab10/tab20-style (dark, light) pairs for empirical_tail_slope datasets.
+# era5/reforecast match COL above; four pre-assigned slots are ready for
+# CMIP models -- add more keys here (same {"color", "ci", "marker"} shape)
+# rather than hardcoding new colors at the call site.
+MODEL_COLORS = {
+    "era5": {"color": "#ff7f0e", "ci": "#ffbb78", "marker": "^"},
+    "reforecast": {"color": "#1f77b4", "ci": "#aec7e8", "marker": "o"},
+    "cmip_model_1": {"color": "#2ca02c", "ci": "#98df8a", "marker": "s"},  # green
+    "cmip_model_2": {"color": "#d62728", "ci": "#ff9896", "marker": "D"},  # red
+    "cmip_model_3": {"color": "#9467bd", "ci": "#c5b0d5", "marker": "P"},  # purple
+    "cmip_model_4": {"color": "#e377c2", "ci": "#f7b6d2", "marker": "X"},  # pink
+}
+
 # ── Shared style settings (AMS/AGU-style) ───────────────────────────────
 plt.rcParams.update(
     {
@@ -150,8 +198,13 @@ def load_reforecast_lead(path: str, lead_day: int, value_col: str) -> pd.DataFra
     return df.dropna(subset=["value"])
 
 
-def load_era5(path: str, target_mmdd: set) -> pd.DataFrame:
-    """Load ERA5 t2m, subset to the given calendar (month, day) values."""
+def load_era5(path: str, target_mmdd: set = None) -> pd.DataFrame:
+    """
+    Load ERA5 t2m, optionally subset to the given calendar (month, day)
+    values. target_mmdd=None returns every calendar day across all years
+    unfiltered -- needed by compute_lead_bias, which looks up ERA5
+    climatology for whatever calendar date each inidate's lead day lands on.
+    """
     era5 = xr.open_dataset(path)
     df = (
         era5.to_dataframe()
@@ -160,9 +213,71 @@ def load_era5(path: str, target_mmdd: set) -> pd.DataFrame:
     )
     df["date"] = pd.to_datetime(df["date"])
     df["valid_mmdd"] = df["date"].dt.strftime("%m-%d")
-    df = df[df["valid_mmdd"].isin(target_mmdd)].copy()
+    if target_mmdd is not None:
+        df = df[df["valid_mmdd"].isin(target_mmdd)].copy()
     df["year"] = df["date"].dt.year
     return df.dropna(subset=["value"])
+
+
+def compute_lead_bias(era5_daily: pd.DataFrame, reforecast_raw: pd.DataFrame, lead_day: int) -> pd.DataFrame:
+    """
+    Genuine climatological mean-bias correction for the reforecast at a
+    specific lead day. See the module docstring's "Reforecast bias
+    correction" section for why this replaces the csv's shipped
+    "adjusted_t2m" (a lead-0-derived regression intercept, invalid at
+    lead 12).
+
+    For each inidate, the model's mean climatology at `lead_day` (mean
+    over ALL ensemble members x hindcast years, valid on that calendar
+    day) is compared against ERA5's mean climatology for that same
+    calendar day across all its years. bias = model_clim - era5_clim is
+    a plain mean difference, robust regardless of how strongly the model
+    and ERA5 correlate across years (unlike a regression intercept).
+
+    era5_daily: full daily ERA5 dataframe (load_era5(path, target_mmdd=None)
+                or any df with a date-like column and a t2m/value column),
+                covering every calendar day across all years.
+    reforecast_raw: the *unfiltered* reforecast dataframe (all lead days),
+                columns 'inidate', 'forecast_date', 'days', 't2m'.
+    lead_day: the lead day to compute bias for (e.g. 12).
+
+    Returns columns ['inidate', 'target_mmdd', 'era5_clim', 'model_clim', 'bias'].
+    Correct the model with apply_bias(), i.e. t2m - bias.
+    """
+    era5 = era5_daily.rename(columns={"time": "date", "t2m": "value"}) if "date" not in era5_daily.columns else era5_daily.copy()
+    value_col = "value" if "value" in era5.columns else "t2m"
+    era5["date"] = pd.to_datetime(era5["date"])
+    era5["month"], era5["day"] = era5["date"].dt.month, era5["date"].dt.day
+
+    lead = reforecast_raw[reforecast_raw["days"] == lead_day].copy()
+    lead["inidate"] = pd.to_datetime(lead["inidate"])
+    lead["forecast_date"] = pd.to_datetime(lead["forecast_date"])
+
+    rows = []
+    for inidate, sub in lead.groupby("inidate"):
+        month, day = sub["forecast_date"].dt.month.iloc[0], sub["forecast_date"].dt.day.iloc[0]
+        era5_clim = era5.loc[(era5["month"] == month) & (era5["day"] == day), value_col].mean()
+        model_clim = sub["t2m"].mean()
+        rows.append({
+            "inidate": inidate, "target_mmdd": f"{month:02d}-{day:02d}",
+            "era5_clim": era5_clim, "model_clim": model_clim, "bias": model_clim - era5_clim,
+        })
+    return pd.DataFrame(rows)
+
+
+def apply_bias(reforecast_df: pd.DataFrame, bias_df: pd.DataFrame, out_col: str = "adjusted_t2m") -> pd.DataFrame:
+    """
+    Merge a compute_lead_bias() result onto reforecast_df (matched on
+    'inidate', which must be the same dtype on both sides -- callers
+    should pd.to_datetime() it first if in doubt) and subtract it from
+    't2m'. Drops any pre-existing 'bias' column first to avoid a merge
+    suffix collision with the csv's original (lead-0-derived) bias column.
+    """
+    df = reforecast_df.drop(columns=["bias"], errors="ignore").merge(
+        bias_df[["inidate", "bias"]], on="inidate", how="left"
+    )
+    df[out_col] = df["t2m"] - df["bias"]
+    return df
 
 
 def fit_pot(
@@ -574,6 +689,88 @@ def plot_return_periods(
     return fig
 
 
+def empirical_tail_slope(values: np.ndarray, threshold_percentile: float = THRESHOLD_PERCENTILE) -> dict:
+    """
+    Distribution-free cross-check on the POT fit: linear regression of
+    ln P(X > x | X > threshold) against magnitude x, using the top
+    (100 - threshold_percentile)% of values directly (Weibull plotting
+    position) -- no Gumbel/GPD assumption. The slope translates into a
+    multiplicative factor: each +1 degree multiplies the within-tail
+    exceedance probability by exp(slope), i.e. "exp(slope)x as likely per
+    +1 degree" or equivalently "1/exp(slope) x rarer per +1 degree".
+    """
+    values = np.asarray(values)
+    threshold = np.percentile(values, threshold_percentile)
+    exceed = np.sort(values[values >= threshold])
+    m = len(exceed)
+    ranks = np.arange(1, m + 1)
+    survival = (m + 1 - ranks) / (m + 1)
+    log_survival = np.log(survival)
+
+    slope, intercept = np.polyfit(exceed, log_survival, 1)
+    pred = slope * exceed + intercept
+    ss_res = np.sum((log_survival - pred) ** 2)
+    ss_tot = np.sum((log_survival - log_survival.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+    return {
+        "threshold": threshold, "exceedances": exceed, "log_survival": log_survival,
+        "m": m, "slope": slope, "intercept": intercept, "r2": r2,
+        "factor_per_plus1degC": np.exp(slope), "factor_per_minus1degC": np.exp(-slope),
+    }
+
+
+def plot_empirical_slopes(
+    datasets: list, xlabel: str = "P(X > x | X > threshold)", ylabel: str = r"t2m ($^\circ$C)"
+):
+    """
+    empirical_tail_slope for an arbitrary list of named datasets, plotted
+    together: x-axis = within-tail exceedance probability (log scale,
+    inverted so rarer sits to the right, matching plot_return_periods'
+    convention), y-axis = magnitude.
+
+    datasets: list of dicts, each with keys:
+        name (str), values (array), color (str), marker (str, optional),
+        threshold_percentile (float, optional, defaults to THRESHOLD_PERCENTILE)
+    To add a CMIP model, append another dict -- e.g.
+        datasets.append({"name": "CMIP6 model A", **MODEL_COLORS["cmip_model_1"],
+                          "values": cmip1_values})
+    Mutates each dict in place with a "_fit" key (the empirical_tail_slope
+    result) so the caller can build a summary table afterward.
+    """
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for ds in datasets:
+        fit = empirical_tail_slope(ds["values"], ds.get("threshold_percentile", THRESHOLD_PERCENTILE))
+        c, marker = ds["color"], ds.get("marker", "o")
+        prob = np.exp(fit["log_survival"])
+        ax.scatter(
+            prob, fit["exceedances"], s=12, color=c, marker=marker, alpha=0.6,
+            label=f"{ds['name']} (empirical)",
+        )
+        logP_line = np.linspace(fit["log_survival"].min(), fit["log_survival"].max(), 100)
+        T_line = (logP_line - fit["intercept"]) / fit["slope"]
+        ax.plot(
+            np.exp(logP_line), T_line, color=c, linewidth=1.4, linestyle="--",
+            label=f"{ds['name']}: {fit['factor_per_plus1degC']:.2f}x per +1$^\\circ$C (R$^2$={fit['r2']:.2f})",
+        )
+        ds["_fit"] = fit
+
+    ax.set_xscale("log")
+    ax.invert_xaxis()
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(True, color=GRID_COLOR, linewidth=0.6, zorder=0)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(
+        frameon=True, facecolor="white", edgecolor="none", framealpha=0.9,
+        fontsize=7, loc="upper left",
+    )
+    fig.tight_layout()
+    return fig, datasets
+
+
 def summarize(name: str, fit: dict) -> dict:
     return {
         "dataset": name,
@@ -625,6 +822,19 @@ def parse_args():
              "fitted curve implies for it (e.g. 39.5 for the 2021 PNW heatwave peak)",
     )
     p.add_argument("--reference-label", default=None)
+    p.add_argument(
+        "--recompute-lead-bias", action="store_true",
+        help="ignore --value-col / the csv's shipped bias column and instead compute a "
+             "proper lead-day-specific mean-climatology bias correction (compute_lead_bias) "
+             "-- see the module docstring; the shipped 'adjusted_t2m' was verified incorrect "
+             "for lead-12 analysis",
+    )
+    p.add_argument(
+        "--empirical-slope-plot", action="store_true",
+        help="also produce a distribution-free tail-slope cross-check plot "
+             "(empirical_tail_slope / plot_empirical_slopes), saved as "
+             "{out_base}_empirical_slope.png/.pdf",
+    )
     return p.parse_args()
 
 
@@ -633,7 +843,29 @@ def main():
     out_csv = f"{args.out_prefix}{OUT_CSV}" if args.out_prefix else OUT_CSV
     out_base = f"{args.out_prefix}{OUT_BASENAME}" if args.out_prefix else OUT_BASENAME
 
-    rf_df = load_reforecast_lead(args.reforecast_csv, args.lead_day, args.value_col)
+    if args.recompute_lead_bias:
+        # Bypasses --value-col / load_reforecast_lead's column selection
+        # entirely: builds rf_df straight from the raw csv plus a freshly
+        # computed lead-day-specific mean bias. See the module docstring's
+        # "Reforecast bias correction" section for why the csv's shipped
+        # "adjusted_t2m" isn't trustworthy for lead-12 analysis.
+        era5_full = load_era5(args.era5_path, target_mmdd=None)
+        reforecast_raw = pd.read_csv(args.reforecast_csv)
+        bias_df = compute_lead_bias(era5_full, reforecast_raw, args.lead_day)
+
+        reforecast_raw["forecast_date"] = pd.to_datetime(reforecast_raw["forecast_date"])
+        reforecast_raw["inidate"] = pd.to_datetime(reforecast_raw["inidate"])
+        rf_df = reforecast_raw[reforecast_raw["days"] == args.lead_day].copy()
+        rf_df = apply_bias(rf_df, bias_df, out_col="value")
+        rf_df["valid_mmdd"] = rf_df["forecast_date"].dt.strftime("%m-%d")
+        rf_df["year"] = rf_df["forecast_date"].dt.year
+        rf_df = rf_df.dropna(subset=["value"])
+
+        print("Recomputed lead-day-specific mean bias (model_clim - era5_clim):")
+        print(bias_df[["target_mmdd", "era5_clim", "model_clim", "bias"]].to_string(index=False))
+    else:
+        rf_df = load_reforecast_lead(args.reforecast_csv, args.lead_day, args.value_col)
+
     target_mmdd = set(rf_df["valid_mmdd"].unique())
     era5_df = load_era5(args.era5_path, target_mmdd)
 
@@ -704,6 +936,24 @@ def main():
     fig.savefig(f"{out_base}.pdf")
     fig.savefig(f"{out_base}.png")
     print(f"\nSaved -> {out_csv}, {out_base}.pdf, {out_base}.png")
+
+    if args.empirical_slope_plot:
+        datasets = [
+            {"name": "ERA5", **MODEL_COLORS["era5"], "values": era5_values},
+            {"name": f"Reforecast day {args.lead_day}", **MODEL_COLORS["reforecast"], "values": rf_values},
+        ]
+        if fit_era5_sens is not None:
+            datasets.append({"name": sens_label, "color": "#555555", "marker": "s", "values": era5_sens_values})
+        fig_slope, datasets = plot_empirical_slopes(datasets)
+        fig_slope.savefig(f"{out_base}_empirical_slope.pdf")
+        fig_slope.savefig(f"{out_base}_empirical_slope.png")
+        print(f"\nEmpirical tail-slope cross-check ({THRESHOLD_PERCENTILE}th percentile threshold):")
+        for ds in datasets:
+            f = ds["_fit"]
+            print(f"  {ds['name']}: m={f['m']}  slope={f['slope']:.4f}/degC  R^2={f['r2']:.3f}  "
+                  f"factor(+1degC)={f['factor_per_plus1degC']:.3f}  "
+                  f"=> {f['factor_per_minus1degC']:.2f}x rarer per +1degC")
+        print(f"Saved -> {out_base}_empirical_slope.pdf, {out_base}_empirical_slope.png")
 
 
 if __name__ == "__main__":
