@@ -77,7 +77,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
-from scipy.stats import gumbel_r, genpareto
+from scipy.stats import gumbel_r, genpareto, genextreme
 
 # ── Defaults (matches scripts/compute_variance.py; override via CLI) ───────
 ERA5_PATH = "/network/group/aopp/predict/AWH020_AYIM_EXTREME/ERA5/era5_t2m/pnw_box_era5.nc"
@@ -223,19 +223,75 @@ def fit_pot(
     }
 
 
+def fit_block_maxima(values: np.ndarray, years: np.ndarray, dist: str = "gumbel") -> dict:
+    """
+    Block-maxima alternative to fit_pot: instead of pooling all dates/years
+    and thresholding to the top 5%, take the single highest value *within
+    each year* (one block maximum per year, n_years total) and fit the
+    extreme-value distribution directly to that full set -- no further
+    thresholding needed, since block maxima are already extremes by
+    construction. This is the classical justification for the Gumbel/GEV
+    family (Fisher-Tippett-Gnedenko theorem), and uses every year's worth
+    of information rather than just the ~5% of dates that happen to be
+    hottest, which is the natural thing to try if a POT fit (fit_pot) is
+    unstable for want of exceedances (e.g. ERA5's m=11 with only 20 years
+    of daily data).
+
+    One block maximum per year by construction means "one event per year"
+    is exact, not an estimated rate -- rate = 1.0 always.
+
+    dist: "gumbel" (2-param) or "gev" (3-param generalized extreme value,
+    scipy's genextreme -- the shape parameter lets the tail depart from
+    the Gumbel's fixed exponential decay, at the cost of needing more data
+    to estimate reliably, same tradeoff as gpd vs. gumbel in fit_pot).
+    """
+    values = np.asarray(values)
+    years = np.asarray(years)
+    uniq_years = np.unique(years)
+    block_max = np.array([values[years == y].max() for y in uniq_years])
+    n_years = len(uniq_years)
+
+    if dist == "gumbel":
+        loc, scale = gumbel_r.fit(block_max)
+        params = {"loc": loc, "scale": scale}
+    elif dist == "gev":
+        c, loc, scale = genextreme.fit(block_max)
+        params = {"c": c, "loc": loc, "scale": scale}
+    else:
+        raise ValueError(f"unknown dist: {dist!r}")
+
+    return {
+        "threshold": block_max.min(),
+        "exceedances": np.sort(block_max),
+        "m": n_years,
+        "n_years": n_years,
+        "n_members": 1,
+        "rate_mode": "block_maxima",
+        "rate": 1.0,  # exactly one block maximum per year
+        "dist": dist,
+        "params": params,
+    }
+
+
 def _sf(fit: dict, x) -> np.ndarray:
     """P(X > x) under the fitted distribution."""
-    if fit["dist"] == "gumbel":
-        return gumbel_r.sf(x, loc=fit["params"]["loc"], scale=fit["params"]["scale"])
-    return genpareto.sf(np.asarray(x) - fit["threshold"], c=fit["params"]["c"], loc=0, scale=fit["params"]["scale"])
+    d, p = fit["dist"], fit["params"]
+    if d == "gumbel":
+        return gumbel_r.sf(x, loc=p["loc"], scale=p["scale"])
+    if d == "gev":
+        return genextreme.sf(x, c=p["c"], loc=p["loc"], scale=p["scale"])
+    return genpareto.sf(np.asarray(x) - fit["threshold"], c=p["c"], loc=0, scale=p["scale"])
 
 
 def _isf(fit: dict, q) -> np.ndarray:
     """x such that P(X > x) = q under the fitted distribution."""
     q = np.clip(q, 1e-300, None)
-    if fit["dist"] == "gumbel":
-        return gumbel_r.isf(q, loc=fit["params"]["loc"], scale=fit["params"]["scale"])
-    return fit["threshold"] + genpareto.isf(q, c=fit["params"]["c"], loc=0, scale=fit["params"]["scale"])
+    d, p = fit["dist"], fit["params"]
+    if d == "gumbel":
+        return gumbel_r.isf(q, loc=p["loc"], scale=p["scale"])
+    if d == "gev":
+        return genextreme.isf(q, c=p["c"], loc=p["loc"], scale=p["scale"])
+    return fit["threshold"] + genpareto.isf(q, c=p["c"], loc=0, scale=p["scale"])
 
 
 def empirical_return_periods(fit: dict):
@@ -325,6 +381,41 @@ def bootstrap_return_level_ci(
     return lower, upper
 
 
+def bootstrap_return_level_ci_block_maxima(
+    block_max_values: np.ndarray,
+    dist: str,
+    return_periods: np.ndarray,
+    n_boot: int = N_BOOTSTRAP,
+    ci: float = CI_LEVEL,
+    seed: int = BOOTSTRAP_SEED,
+):
+    """Case-resampling bootstrap CI for a fit_block_maxima curve (rate fixed at 1/yr)."""
+    block_max_values = np.asarray(block_max_values)
+    n = len(block_max_values)
+    rng = np.random.default_rng(seed)
+    boot_levels = np.full((n_boot, len(return_periods)), np.nan)
+
+    for b in range(n_boot):
+        sample = rng.choice(block_max_values, size=n, replace=True)
+        try:
+            if dist == "gumbel":
+                loc, scale = gumbel_r.fit(sample)
+                params = {"loc": loc, "scale": scale}
+            else:
+                c, loc, scale = genextreme.fit(sample)
+                params = {"c": c, "loc": loc, "scale": scale}
+            fit_b = {"dist": dist, "params": params, "rate": 1.0, "threshold": sample.min()}
+            boot_levels[b] = fitted_return_levels(fit_b, return_periods)
+        except Exception:
+            continue
+
+    lo_pct, hi_pct = 100 * (1 - ci) / 2, 100 * (1 + ci) / 2
+    with np.errstate(invalid="ignore"):
+        lower = np.nanpercentile(boot_levels, lo_pct, axis=0)
+        upper = np.nanpercentile(boot_levels, hi_pct, axis=0)
+    return lower, upper
+
+
 def plot_return_periods(
     fit_era5: dict,
     fit_rf: dict,
@@ -334,6 +425,9 @@ def plot_return_periods(
     fit_era5_sensitivity: dict = None,
     era5_sensitivity_values: np.ndarray = None,
     sensitivity_label: str = None,
+    fit_era5_block_maxima: dict = None,
+    era5_block_maxima_values: np.ndarray = None,
+    block_maxima_label: str = None,
     reference_value: float = None,
     reference_label: str = None,
     xscale: str = "log",
@@ -352,6 +446,11 @@ def plot_return_periods(
     single most extreme point dropped -- drawn as a dotted overlay so the
     two ERA5 curves can be compared directly for sensitivity to that point.
 
+    fit_era5_block_maxima (optional): a fit_block_maxima result -- drawn as
+    a dash-dot overlay, for comparing the POT fit against fitting directly
+    to one maximum per year (era5_block_maxima_values must be the block
+    maxima array itself, for bootstrapping).
+
     reference_value (optional): draws a horizontal line (e.g. the 2021 PNW
     heatwave's observed peak) and marks/annotates the return period each
     fitted curve implies for it.
@@ -361,6 +460,11 @@ def plot_return_periods(
         curves.append(
             (fit_era5_sensitivity, era5_sensitivity_values, "#555555", "#cccccc", ":",
              sensitivity_label or "ERA5 (sensitivity)")
+        )
+    if fit_era5_block_maxima is not None:
+        curves.append(
+            (fit_era5_block_maxima, era5_block_maxima_values, "#8c564b", "#c49c94", "-.",
+             block_maxima_label or "ERA5 (block maxima)")
         )
     curves.append(
         (fit_rf, rf_values, COL["reforecast"], COL["reforecast_ci"], "--",
@@ -385,9 +489,12 @@ def plot_return_periods(
     fig, ax = plt.subplots(figsize=(7.2, 4.8))
 
     for fit, values, _, ci_color, _, _ in curves:
-        lower, upper = bootstrap_return_level_ci(
-            values, fit["n_years"], fit["n_members"], fit["rate_mode"], T_fit, dist=fit["dist"]
-        )
+        if fit["rate_mode"] == "block_maxima":
+            lower, upper = bootstrap_return_level_ci_block_maxima(values, fit["dist"], T_fit)
+        else:
+            lower, upper = bootstrap_return_level_ci(
+                values, fit["n_years"], fit["n_members"], fit["rate_mode"], T_fit, dist=fit["dist"]
+            )
         ax.fill_between(T_fit, lower, upper, color=ci_color, alpha=0.6, linewidth=0, zorder=1)
 
     T_emp_era5, x_emp_era5 = empirical_return_periods(fit_era5)
@@ -402,7 +509,7 @@ def plot_return_periods(
         label=f"Reforecast day {lead_day} (empirical)", zorder=2,
     )
 
-    dist_label = {"gumbel": "Gumbel", "gpd": "GPD"}
+    dist_label = {"gumbel": "Gumbel", "gpd": "GPD", "gev": "GEV"}
     for fit, _, color, _, linestyle, label in curves:
         ax.plot(
             T_fit, fitted_return_levels(fit, T_fit), color=color,
@@ -459,7 +566,7 @@ def summarize(name: str, fit: dict) -> dict:
         "n_years": fit["n_years"],
         "n_members": fit["n_members"],
         "rate_mode": fit["rate_mode"],
-        "threshold_pct": THRESHOLD_PERCENTILE,
+        "threshold_pct": None if fit["rate_mode"] == "block_maxima" else THRESHOLD_PERCENTILE,
         "threshold": fit["threshold"],
         "n_exceedances": fit["m"],
         "rate_per_year": fit["rate"],
@@ -486,6 +593,17 @@ def parse_args():
     p.add_argument(
         "--drop-era5-max", action="store_true",
         help="also fit ERA5 with its single highest value removed, overlaid for comparison",
+    )
+    p.add_argument(
+        "--era5-block-maxima", action="store_true",
+        help="also fit ERA5 using one maximum per year (20 points, no POT threshold) instead "
+             "of the pooled top-5%% -- a check for whether limited POT exceedance counts "
+             "(e.g. m=11) are driving instability, overlaid for comparison",
+    )
+    p.add_argument(
+        "--block-maxima-dist", default="gumbel", choices=["gumbel", "gev"],
+        help="distribution for --era5-block-maxima: gumbel (2-param) or gev (3-param, scipy "
+             "genextreme)",
     )
     p.add_argument(
         "--reference-value", type=float, default=None,
@@ -529,6 +647,16 @@ def main():
         summaries.append(summarize("era5_excl_max", fit_era5_sens))
         print(f"Dropped ERA5 max: {dropped_value:.3f} (of {len(era5_values)} points)")
 
+    fit_era5_bm, era5_bm_values, bm_label = None, None, None
+    if args.era5_block_maxima:
+        fit_era5_bm = fit_block_maxima(
+            era5_values, era5_df["year"].values, dist=args.block_maxima_dist
+        )
+        era5_bm_values = fit_era5_bm["exceedances"]  # the block maxima themselves, sorted
+        bm_label = "ERA5 (block maxima)"
+        summaries.append(summarize("era5_block_maxima", fit_era5_bm))
+        print(f"ERA5 block maxima: {fit_era5_bm['m']} years -> {sorted(era5_bm_values.round(2))}")
+
     summary = pd.DataFrame(summaries)
     summary.to_csv(out_csv, index=False)
     print(f"ERA5: n={len(era5_df)} over {n_years_era5} yr, {len(target_mmdd)} dates/yr")
@@ -539,6 +667,8 @@ def main():
         curves = [("ERA5", fit_era5)]
         if fit_era5_sens is not None:
             curves.append((sens_label, fit_era5_sens))
+        if fit_era5_bm is not None:
+            curves.append((bm_label, fit_era5_bm))
         curves.append((f"Reforecast day {args.lead_day}", fit_rf))
         print(f"\nReturn period implied by {args.reference_value:g}:")
         for label, fit in curves:
@@ -553,6 +683,8 @@ def main():
         fit_era5, fit_rf, era5_values, rf_values, args.lead_day,
         fit_era5_sensitivity=fit_era5_sens, era5_sensitivity_values=era5_sens_values,
         sensitivity_label=sens_label,
+        fit_era5_block_maxima=fit_era5_bm, era5_block_maxima_values=era5_bm_values,
+        block_maxima_label=bm_label,
         reference_value=args.reference_value, reference_label=args.reference_label,
     )
     fig.savefig(f"{out_base}.pdf")
