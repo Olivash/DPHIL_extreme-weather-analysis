@@ -57,6 +57,26 @@ real world variability.
 The ERA5 convergence day is the one relevant to the lead time justification in
 the JoC paper (day 12, ratio 0.973, on the current dataset).
 
+### `scripts/fit_gumbel_return_periods.py`
+
+Fits a Gumbel distribution to the top 5% of ERA5 t2m and of reforecast t2m at
+a single lead day (day 12 by default), pooling across the JJA valid-date
+window, all years, and (for the reforecast) all ensemble members, then plots
+return periods in years for both datasets on one axis, with empirical
+(plotting-position) points alongside the fitted curves.
+
+Ensemble members are treated as independent draws to extend the reforecast's
+effective record length beyond its calendar years, matching this repo's
+sample-size assumption for the reforecast; `RATE_MODE` at the top of the
+script switches between that framework (`"unseen"`) and a mode that keeps the
+reforecast's annual occurrence rate equal to ERA5's (`"match_era5"`), so the
+two curves are comparable at face value.
+
+If you have a specific list of target dates rather than the full
+`06-15`-`07-21` window, set `TARGET_DATES` at the top of the script.
+
+Output: `gumbel_return_period_summary.csv`, `gumbel_return_periods.pdf/.png`
+
 ## Requirements
 
 ```
@@ -64,6 +84,7 @@ numpy
 pandas
 xarray
 matplotlib
+scipy
 ```
 
 ## Usage
@@ -74,10 +95,12 @@ Run in this order, from the same working directory:
 python scripts/compute_variance.py
 python scripts/plot_variance_figures.py
 python scripts/plot_variance_figures_2.py
+python scripts/fit_gumbel_return_periods.py
 ```
 
 Both plotting scripts read `variance_summary_all.csv`, produced by the first
-script.
+script. `fit_gumbel_return_periods.py` is independent of the other three --
+it reads `pnw_box_era5.nc` and `reforecast_0_t0_13.csv` directly.
 
 ## Data paths
 
