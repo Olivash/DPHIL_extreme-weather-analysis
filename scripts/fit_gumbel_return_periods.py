@@ -58,9 +58,11 @@ REFORE_CSV  reforecast csv with columns: inidate, hDate, number, t2m,
 
 Outputs
 -------
-gumbel_return_period_summary.csv         fitted parameters + rates, both datasets
-gumbel_return_periods_log10.pdf/.png     return period plot, log10-scaled x-axis
-gumbel_return_periods_linear.pdf/.png    same plot, linear (actual year) x-axis
+gumbel_return_period_summary.csv   fitted parameters + rates, both datasets
+gumbel_return_periods.pdf/.png     return period plot (log10-scaled x-axis).
+                                    Reference-value crossings, if requested,
+                                    are reported in the on-plot summary box
+                                    in both plain and scientific notation.
 
 Usage
 -----
@@ -220,6 +222,17 @@ def fitted_return_levels(fit: dict, return_periods: np.ndarray) -> np.ndarray:
     return np.where(q < 1, x, np.nan)
 
 
+def format_scientific(x: float) -> str:
+    """'8.4e+04' -> mathtext '$8.4\\times10^{4}$', for the summary box."""
+    if not np.isfinite(x):
+        return r"$\infty$"
+    if x == 0:
+        return "0"
+    exp = int(np.floor(np.log10(abs(x))))
+    mantissa = x / 10**exp
+    return rf"${mantissa:.1f}\times10^{{{exp}}}$"
+
+
 def return_period_for_value(fit: dict, x: float) -> float:
     """Invert fitted_return_levels: the Gumbel-fit return period implied by value x."""
     q = 1 - gumbel_r.cdf(x, loc=fit["loc"], scale=fit["scale"])  # P(X > x)
@@ -368,9 +381,9 @@ def plot_return_periods(
             T_ref = return_period_for_value(fit, reference_value)
             if np.isfinite(T_ref) and T_ref <= T_fit.max():
                 ax.scatter([T_ref], [reference_value], color=color, marker="x", s=45, zorder=6)
-                lines.append(f"{label}: {T_ref:,.0f} yr")
+                lines.append(f"{label}: {T_ref:,.0f} yr ({format_scientific(T_ref)} yr)")
             elif np.isfinite(T_ref):
-                lines.append(f"{label}: {T_ref:,.0f} yr (off-chart)")
+                lines.append(f"{label}: {T_ref:,.0f} yr ({format_scientific(T_ref)} yr, off-chart)")
             else:
                 lines.append(f"{label}: never (beyond fit's upper support)")
         ax.text(
@@ -481,20 +494,21 @@ def main():
         print(f"\nReturn period implied by {args.reference_value:g}:")
         for label, fit in curves:
             T_ref = return_period_for_value(fit, args.reference_value)
-            print(f"  {label}: {T_ref:,.1f} yr" if np.isfinite(T_ref) else f"  {label}: never (below fit support)")
+            if np.isfinite(T_ref):
+                exp = int(np.floor(np.log10(T_ref))) if T_ref > 0 else 0
+                print(f"  {label}: {T_ref:,.1f} yr ({T_ref / 10**exp:.1f}e{exp:+03d} yr)")
+            else:
+                print(f"  {label}: never (below fit support)")
 
-    print(f"\nSaved -> {out_csv}")
-    for xscale, suffix in (("log", "_log10"), ("linear", "_linear")):
-        fig = plot_return_periods(
-            fit_era5, fit_rf, era5_values, rf_values, args.lead_day,
-            fit_era5_sensitivity=fit_era5_sens, era5_sensitivity_values=era5_sens_values,
-            sensitivity_label=sens_label,
-            reference_value=args.reference_value, reference_label=args.reference_label,
-            xscale=xscale,
-        )
-        fig.savefig(f"{out_base}{suffix}.pdf")
-        fig.savefig(f"{out_base}{suffix}.png")
-        print(f"Saved -> {out_base}{suffix}.pdf, {out_base}{suffix}.png")
+    fig = plot_return_periods(
+        fit_era5, fit_rf, era5_values, rf_values, args.lead_day,
+        fit_era5_sensitivity=fit_era5_sens, era5_sensitivity_values=era5_sens_values,
+        sensitivity_label=sens_label,
+        reference_value=args.reference_value, reference_label=args.reference_label,
+    )
+    fig.savefig(f"{out_base}.pdf")
+    fig.savefig(f"{out_base}.png")
+    print(f"\nSaved -> {out_csv}, {out_base}.pdf, {out_base}.png")
 
 
 if __name__ == "__main__":
