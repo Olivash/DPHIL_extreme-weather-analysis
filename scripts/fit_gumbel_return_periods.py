@@ -58,8 +58,9 @@ REFORE_CSV  reforecast csv with columns: inidate, hDate, number, t2m,
 
 Outputs
 -------
-gumbel_return_period_summary.csv   fitted parameters + rates, both datasets
-gumbel_return_periods.pdf/.png     return period plot
+gumbel_return_period_summary.csv         fitted parameters + rates, both datasets
+gumbel_return_periods_log10.pdf/.png     return period plot, log10-scaled x-axis
+gumbel_return_periods_linear.pdf/.png    same plot, linear (actual year) x-axis
 
 Usage
 -----
@@ -100,8 +101,14 @@ N_BOOTSTRAP = 1000
 CI_LEVEL = 0.90  # 90% bootstrap band (5th-95th percentile)
 BOOTSTRAP_SEED = 0
 
-# Wong/Okabe-Ito colourblind-safe palette, matches plot_variance_figures.py
-COL = {"era5": "#009E73", "reforecast": "#D55E00", "reference": "#000000"}
+COL = {
+    "era5": "#ff7f0e",
+    "era5_ci": "#ffbb78",
+    "reforecast": "#1f77b4",
+    "reforecast_ci": "#aec7e8",
+    "reference": "#000000",
+}
+GRID_COLOR = "#d3d3d3"
 
 # ── Shared style settings (AMS/AGU-style) ───────────────────────────────
 plt.rcParams.update(
@@ -274,6 +281,7 @@ def plot_return_periods(
     sensitivity_label: str = None,
     reference_value: float = None,
     reference_label: str = None,
+    xscale: str = "log",
 ):
     """
     Return-period plot for both datasets: empirical (plotting-position)
@@ -281,6 +289,9 @@ def plot_return_periods(
     era5_values / rf_values are the full pooled arrays (not just the
     exceedances) since the bootstrap re-selects its own threshold on
     each resample.
+
+    xscale: "log" (return period axis in powers of 10) or "linear"
+    (actual year values).
 
     fit_era5_sensitivity (optional): a second ERA5 fit -- e.g. with its
     single most extreme point dropped -- drawn as a dotted overlay so the
@@ -290,14 +301,15 @@ def plot_return_periods(
     heatwave's observed peak) and marks/annotates the return period each
     fitted curve implies for it.
     """
-    curves = [(fit_era5, era5_values, "era5", COL["era5"], "-", "ERA5")]
+    curves = [(fit_era5, era5_values, COL["era5"], COL["era5_ci"], "-", "ERA5")]
     if fit_era5_sensitivity is not None:
         curves.append(
-            (fit_era5_sensitivity, era5_sensitivity_values, "era5", "#555555", ":",
+            (fit_era5_sensitivity, era5_sensitivity_values, "#555555", "#cccccc", ":",
              sensitivity_label or "ERA5 (sensitivity)")
         )
     curves.append(
-        (fit_rf, rf_values, "reforecast", COL["reforecast"], "--", f"Reforecast day {lead_day}")
+        (fit_rf, rf_values, COL["reforecast"], COL["reforecast_ci"], "--",
+         f"Reforecast day {lead_day}")
     )
 
     # Extend the return-period axis far enough to show the *nearest* curve's
@@ -317,11 +329,11 @@ def plot_return_periods(
 
     fig, ax = plt.subplots(figsize=(7.2, 4.8))
 
-    for fit, values, ci_key, color, _, _ in curves:
+    for fit, values, _, ci_color, _, _ in curves:
         lower, upper = bootstrap_return_level_ci(
             values, fit["n_years"], fit["n_members"], fit["rate_mode"], T_fit
         )
-        ax.fill_between(T_fit, lower, upper, color=color, alpha=0.12, linewidth=0, zorder=1)
+        ax.fill_between(T_fit, lower, upper, color=ci_color, alpha=0.6, linewidth=0, zorder=1)
 
     T_emp_era5, x_emp_era5 = empirical_return_periods(fit_era5)
     T_emp_rf, x_emp_rf = empirical_return_periods(fit_rf)
@@ -335,7 +347,7 @@ def plot_return_periods(
         label=f"Reforecast day {lead_day} (empirical)", zorder=2,
     )
 
-    for fit, _, _, color, linestyle, label in curves:
+    for fit, _, color, _, linestyle, label in curves:
         ax.plot(
             T_fit, fitted_return_levels(fit, T_fit), color=color,
             linewidth=1.4, linestyle=linestyle, label=f"{label} (Gumbel fit)", zorder=4,
@@ -352,7 +364,7 @@ def plot_return_periods(
 
         ref_desc = reference_label or f"{reference_value:g}"
         lines = [f"Return period implied by {ref_desc}:"]
-        for fit, _, _, color, _, label in curves:
+        for fit, _, color, _, _, label in curves:
             T_ref = return_period_for_value(fit, reference_value)
             if np.isfinite(T_ref) and T_ref <= T_fit.max():
                 ax.scatter([T_ref], [reference_value], color=color, marker="x", s=45, zorder=6)
@@ -367,11 +379,13 @@ def plot_return_periods(
             bbox=dict(boxstyle="round", facecolor="white", edgecolor="0.7", alpha=0.9),
         )
 
-    ax.set_xscale("log")
+    ax.set_xscale(xscale)
     ax.set_xlabel("Return period (years)")
     ax.set_ylabel(r"t2m ($^\circ$C)")
     if reference_value is not None:
         ax.set_ylim(top=max(ax.get_ylim()[1], reference_value + 1))
+    ax.grid(True, color=GRID_COLOR, linewidth=0.6, zorder=0)
+    ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.legend(
@@ -469,15 +483,18 @@ def main():
             T_ref = return_period_for_value(fit, args.reference_value)
             print(f"  {label}: {T_ref:,.1f} yr" if np.isfinite(T_ref) else f"  {label}: never (below fit support)")
 
-    fig = plot_return_periods(
-        fit_era5, fit_rf, era5_values, rf_values, args.lead_day,
-        fit_era5_sensitivity=fit_era5_sens, era5_sensitivity_values=era5_sens_values,
-        sensitivity_label=sens_label,
-        reference_value=args.reference_value, reference_label=args.reference_label,
-    )
-    fig.savefig(f"{out_base}.pdf")
-    fig.savefig(f"{out_base}.png")
-    print(f"\nSaved -> {out_csv}, {out_base}.pdf, {out_base}.png")
+    print(f"\nSaved -> {out_csv}")
+    for xscale, suffix in (("log", "_log10"), ("linear", "_linear")):
+        fig = plot_return_periods(
+            fit_era5, fit_rf, era5_values, rf_values, args.lead_day,
+            fit_era5_sensitivity=fit_era5_sens, era5_sensitivity_values=era5_sens_values,
+            sensitivity_label=sens_label,
+            reference_value=args.reference_value, reference_label=args.reference_label,
+            xscale=xscale,
+        )
+        fig.savefig(f"{out_base}{suffix}.pdf")
+        fig.savefig(f"{out_base}{suffix}.png")
+        print(f"Saved -> {out_base}{suffix}.pdf, {out_base}{suffix}.png")
 
 
 if __name__ == "__main__":
