@@ -39,14 +39,15 @@ went into the fit (it's the n_members-fold rate inflation that pulls it
 back down to a ~n_years return period despite the deeper pooled sample).
 ERA5 has n_members = 1, so both modes agree for ERA5.
 
-Caveat: fitting a plain (unconditional) Gumbel by MLE to a top-percentile
-subset is what was asked for here, but it is an approximation -- the
-textbook peaks-over-threshold model fits a generalized Pareto to the
-threshold exceedances (values - threshold) instead, precisely because a
-Gumbel fit to a left-truncated sample is a biased estimator of the
-unconditional distribution. If the two datasets' fitted curves look
-inconsistent with their own empirical points, that's the first thing to
-swap out (see fit_pot_gumbel).
+Distribution (--dist)
+---------------------
+"gumbel" (default) fits a plain, unconditional Gumbel by MLE to the top
+5%, which is what was originally asked for here, but it is an
+approximation -- a Gumbel fit to an already-thresholded sample is a
+biased estimator of the unconditional distribution. "gpd" instead fits
+the textbook peaks-over-threshold model: a generalized Pareto to the
+threshold exceedances (values - threshold), which is the distribution
+POT theory actually motivates. See fit_pot.
 
 Inputs
 ------
@@ -76,7 +77,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
-from scipy.stats import gumbel_r
+from scipy.stats import gumbel_r, genpareto
 
 # ── Defaults (matches scripts/compute_variance.py; override via CLI) ───────
 ERA5_PATH = "/network/group/aopp/predict/AWH020_AYIM_EXTREME/ERA5/era5_t2m/pnw_box_era5.nc"
@@ -164,13 +165,29 @@ def load_era5(path: str, target_mmdd: set) -> pd.DataFrame:
     return df.dropna(subset=["value"])
 
 
-def fit_pot_gumbel(
-    values: np.ndarray, n_years: int, n_members: int = 1, rate_mode: str = "unseen"
+def fit_pot(
+    values: np.ndarray,
+    n_years: int,
+    n_members: int = 1,
+    rate_mode: str = "unseen",
+    dist: str = "gumbel",
 ) -> dict:
     """
-    Fit a Gumbel distribution to the top (100 - THRESHOLD_PERCENTILE)% of
-    values, and derive an annual occurrence rate for those exceedances
-    under the given rate_mode. See the module docstring.
+    Fit a distribution to the top (100 - THRESHOLD_PERCENTILE)% of values,
+    and derive an annual occurrence rate for those exceedances under the
+    given rate_mode. See the module docstring.
+
+    dist:
+      "gumbel" -- plain (unconditional) Gumbel MLE fit to the raw
+                  exceedance values. What was originally asked for here;
+                  an approximation (see module docstring caveat).
+      "gpd"    -- textbook peaks-over-threshold model: a generalized
+                  Pareto fit (via MLE, location fixed at 0) to the
+                  exceedances *above* the threshold (values - threshold).
+                  This is the distribution POT theory actually motivates,
+                  since GPD is the limiting distribution of threshold
+                  exceedances as the threshold rises, unlike an
+                  unconditional Gumbel fit to a left-truncated sample.
     """
     values = np.asarray(values)
     threshold = np.percentile(values, THRESHOLD_PERCENTILE)
@@ -184,7 +201,15 @@ def fit_pot_gumbel(
     else:
         raise ValueError(f"unknown rate_mode: {rate_mode!r}")
 
-    loc, scale = gumbel_r.fit(exceed)
+    if dist == "gumbel":
+        loc, scale = gumbel_r.fit(exceed)
+        params = {"loc": loc, "scale": scale}
+    elif dist == "gpd":
+        c, loc, scale = genpareto.fit(exceed - threshold, floc=0)
+        params = {"c": c, "loc": loc, "scale": scale}
+    else:
+        raise ValueError(f"unknown dist: {dist!r}")
+
     return {
         "threshold": threshold,
         "exceedances": exceed,
@@ -193,9 +218,24 @@ def fit_pot_gumbel(
         "n_members": n_members,
         "rate_mode": rate_mode,
         "rate": rate,  # exceedances of `threshold` per effective year
-        "loc": loc,
-        "scale": scale,
+        "dist": dist,
+        "params": params,
     }
+
+
+def _sf(fit: dict, x) -> np.ndarray:
+    """P(X > x) under the fitted distribution."""
+    if fit["dist"] == "gumbel":
+        return gumbel_r.sf(x, loc=fit["params"]["loc"], scale=fit["params"]["scale"])
+    return genpareto.sf(np.asarray(x) - fit["threshold"], c=fit["params"]["c"], loc=0, scale=fit["params"]["scale"])
+
+
+def _isf(fit: dict, q) -> np.ndarray:
+    """x such that P(X > x) = q under the fitted distribution."""
+    q = np.clip(q, 1e-300, None)
+    if fit["dist"] == "gumbel":
+        return gumbel_r.isf(q, loc=fit["params"]["loc"], scale=fit["params"]["scale"])
+    return fit["threshold"] + genpareto.isf(q, c=fit["params"]["c"], loc=0, scale=fit["params"]["scale"])
 
 
 def empirical_return_periods(fit: dict):
@@ -209,16 +249,17 @@ def empirical_return_periods(fit: dict):
 
 def fitted_return_levels(fit: dict, return_periods: np.ndarray) -> np.ndarray:
     """
-    Gumbel-fit return level x(T) for each return period T (years).
+    Fitted return level x(T) for each return period T (years).
 
     T below 1/rate implies an exceedance probability q = 1/(rate*T) > 1,
     which is undefined -- there's no return level shorter than the
     average spacing between threshold exceedances. Those points are NaN
     (dropped by the plot) rather than clipped, which would otherwise
-    produce a spurious plunge toward the Gumbel's unbounded lower tail.
+    produce a spurious plunge toward the fitted distribution's tail
+    (unbounded below, for a Gumbel fit).
     """
     q = 1.0 / (fit["rate"] * return_periods)  # P(X > x) implied by T
-    x = gumbel_r.ppf(1 - np.clip(q, None, 1 - 1e-12), loc=fit["loc"], scale=fit["scale"])
+    x = _isf(fit, np.clip(q, None, 1 - 1e-12))
     return np.where(q < 1, x, np.nan)
 
 
@@ -234,8 +275,8 @@ def format_scientific(x: float) -> str:
 
 
 def return_period_for_value(fit: dict, x: float) -> float:
-    """Invert fitted_return_levels: the Gumbel-fit return period implied by value x."""
-    q = 1 - gumbel_r.cdf(x, loc=fit["loc"], scale=fit["scale"])  # P(X > x)
+    """Invert fitted_return_levels: the fitted return period implied by value x."""
+    q = float(_sf(fit, x))  # P(X > x)
     if q <= 0:
         return np.inf
     return 1.0 / (fit["rate"] * q)
@@ -247,6 +288,7 @@ def bootstrap_return_level_ci(
     n_members: int,
     rate_mode: str,
     return_periods: np.ndarray,
+    dist: str = "gumbel",
     n_boot: int = N_BOOTSTRAP,
     ci: float = CI_LEVEL,
     seed: int = BOOTSTRAP_SEED,
@@ -256,9 +298,9 @@ def bootstrap_return_level_ci(
 
     Each replicate resamples the pooled values with replacement (same
     size as the original), then re-selects the top-5% threshold, refits
-    the Gumbel, and recomputes the return-level curve -- so the band
-    reflects both sampling uncertainty in the Gumbel parameters and in
-    the threshold itself. Consistent with this analysis treating all
+    the distribution, and recomputes the return-level curve -- so the
+    band reflects both sampling uncertainty in the fitted parameters and
+    in the threshold itself. Consistent with this analysis treating all
     pooled points as independent draws.
     """
     values = np.asarray(values)
@@ -269,7 +311,7 @@ def bootstrap_return_level_ci(
     for b in range(n_boot):
         sample = rng.choice(values, size=n, replace=True)
         try:
-            fit_b = fit_pot_gumbel(sample, n_years, n_members, rate_mode)
+            fit_b = fit_pot(sample, n_years, n_members, rate_mode, dist=dist)
             if fit_b["m"] < 2:
                 continue
             boot_levels[b] = fitted_return_levels(fit_b, return_periods)
@@ -344,7 +386,7 @@ def plot_return_periods(
 
     for fit, values, _, ci_color, _, _ in curves:
         lower, upper = bootstrap_return_level_ci(
-            values, fit["n_years"], fit["n_members"], fit["rate_mode"], T_fit
+            values, fit["n_years"], fit["n_members"], fit["rate_mode"], T_fit, dist=fit["dist"]
         )
         ax.fill_between(T_fit, lower, upper, color=ci_color, alpha=0.6, linewidth=0, zorder=1)
 
@@ -360,10 +402,12 @@ def plot_return_periods(
         label=f"Reforecast day {lead_day} (empirical)", zorder=2,
     )
 
+    dist_label = {"gumbel": "Gumbel", "gpd": "GPD"}
     for fit, _, color, _, linestyle, label in curves:
         ax.plot(
             T_fit, fitted_return_levels(fit, T_fit), color=color,
-            linewidth=1.4, linestyle=linestyle, label=f"{label} (Gumbel fit)", zorder=4,
+            linewidth=1.4, linestyle=linestyle,
+            label=f"{label} ({dist_label[fit['dist']]} fit)", zorder=4,
         )
     ax.plot([], [], color=COL["reference"], alpha=0.25, linewidth=8,
             label=f"{int(CI_LEVEL * 100)}% bootstrap CI")
@@ -419,8 +463,8 @@ def summarize(name: str, fit: dict) -> dict:
         "threshold": fit["threshold"],
         "n_exceedances": fit["m"],
         "rate_per_year": fit["rate"],
-        "gumbel_loc": fit["loc"],
-        "gumbel_scale": fit["scale"],
+        "dist": fit["dist"],
+        **{f"param_{k}": v for k, v in fit["params"].items()},
     }
 
 
@@ -432,6 +476,11 @@ def parse_args():
     p.add_argument("--value-col", default=REFORECAST_VALUE_COL)
     p.add_argument(
         "--rate-mode", default=RATE_MODE, choices=["unseen", "per_calendar_year"]
+    )
+    p.add_argument(
+        "--dist", default="gumbel", choices=["gumbel", "gpd"],
+        help="gumbel: unconditional Gumbel MLE fit to the top 5%% (as originally asked). "
+             "gpd: textbook POT model, generalized Pareto fit to the threshold exceedances.",
     )
     p.add_argument("--out-prefix", default=None, help="directory/prefix for outputs")
     p.add_argument(
@@ -463,9 +512,9 @@ def main():
     era5_values = era5_df["value"].values
     rf_values = rf_df["value"].values
 
-    fit_era5 = fit_pot_gumbel(era5_values, n_years_era5)
-    fit_rf = fit_pot_gumbel(
-        rf_values, n_years_rf, n_members=n_members_rf, rate_mode=args.rate_mode
+    fit_era5 = fit_pot(era5_values, n_years_era5, dist=args.dist)
+    fit_rf = fit_pot(
+        rf_values, n_years_rf, n_members=n_members_rf, rate_mode=args.rate_mode, dist=args.dist
     )
 
     summaries = [summarize("era5", fit_era5), summarize(f"reforecast_day{args.lead_day}", fit_rf)]
@@ -475,7 +524,7 @@ def main():
         drop_idx = np.argmax(era5_values)
         dropped_value = era5_values[drop_idx]
         era5_sens_values = np.delete(era5_values, drop_idx)
-        fit_era5_sens = fit_pot_gumbel(era5_sens_values, n_years_era5)
+        fit_era5_sens = fit_pot(era5_sens_values, n_years_era5, dist=args.dist)
         sens_label = "ERA5 (excl. max)"
         summaries.append(summarize("era5_excl_max", fit_era5_sens))
         print(f"Dropped ERA5 max: {dropped_value:.3f} (of {len(era5_values)} points)")
