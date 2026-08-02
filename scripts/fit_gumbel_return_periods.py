@@ -3,17 +3,41 @@ Gumbel POT return periods: ERA5 vs. reforecast (single lead day).
 
 Fits a Gumbel distribution to the top 5% (values above the 95th
 percentile) of ERA5 t2m and reforecast t2m at a fixed lead day, pooled
-across the JJA heatwave valid-date window and all years/ensemble members,
-then converts fitted and empirical exceedance probabilities into return
-periods in years.
+across all years and (for the reforecast) all ensemble members, then
+converts fitted and empirical exceedance probabilities into return
+periods in years. 90% bootstrap confidence bands are shown around each
+fitted curve (see bootstrap_return_level_ci).
 
-Reforecast ensemble members are treated as independent draws (as stated
-for this analysis, in the spirit of the UNSEEN approach -- e.g. Thompson
-et al. 2017, Kelder et al. 2020) to extend the effective record length
-beyond the calendar years actually sampled. See RATE_MODE below: this is
-the one modelling choice in this script that materially changes the
-reforecast return-period axis, so it is kept as an explicit switch rather
-than baked in.
+The reforecast's valid dates at the chosen lead day (forecast_date =
+inidate + lead_day) are taken as the definition of "the same dates" --
+ERA5 is subset to exactly that set of calendar (month, day) values, not a
+broader date window, so the two datasets are compared on the same 11
+valid dates x 20 years.
+
+Annual occurrence rate (RATE_MODE)
+-----------------------------------
+Ensemble members are alternate, equally-plausible realizations of the
+*same* year, not extra calendar years -- so the correct normalization for
+"the reforecast has n_years x n_members independent samples" (as stated
+for this analysis, in the spirit of the UNSEEN approach, e.g. Thompson et
+al. 2017, Kelder et al. 2020) is to divide exceedance counts by
+n_years x n_members, not by n_years alone. Dividing by n_years alone would
+claim extreme days become n_members times more frequent per real calendar
+year, which members don't represent.
+
+Concretely: with m exceedances pooled from n_years x n_members points,
+    "unseen"            -> rate = m / (n_years * n_members)   [default]
+    "per_calendar_year"  -> rate = m / n_years                [kept only
+                             for comparison -- overstates annual frequency]
+The two give the same reforecast curve shape (same Gumbel fit, since that
+doesn't depend on rate_mode) but very different x-axis placement: e.g. the
+single hottest pooled reforecast value sits at roughly (n_years*n_members)
+years under "unseen" vs. only about n_years years under
+"per_calendar_year" -- because "per_calendar_year" is, empirically, always
+close to n_years for the max point regardless of how many exceedances
+went into the fit (it's the n_members-fold rate inflation that pulls it
+back down to a ~n_years return period despite the deeper pooled sample).
+ERA5 has n_members = 1, so both modes agree for ERA5.
 
 Caveat: fitting a plain (unconditional) Gumbel by MLE to a top-percentile
 subset is what was asked for here, but it is an approximation -- the
@@ -26,16 +50,24 @@ swap out (see fit_pot_gumbel).
 
 Inputs
 ------
-pnw_box_era5.nc                 ERA5 t2m over the PNW box
-reforecast_0_t0_13.csv          medium-range reforecast (days 0-13)
-                                 columns: inidate, hDate, number, t2m,
-                                 days, day_month, forecast_date
+ERA5_PATH   NetCDF with a `time` coordinate and a `t2m` variable (daily,
+            already box-averaged -- e.g. pnw_box_era5.nc)
+REFORE_CSV  reforecast csv with columns: inidate, hDate, number, t2m,
+            days (lead day), forecast_date, and optionally a
+            bias-corrected column (see REFORECAST_VALUE_COL)
 
 Outputs
 -------
 gumbel_return_period_summary.csv   fitted parameters + rates, both datasets
 gumbel_return_periods.pdf/.png     return period plot
+
+Usage
+-----
+python fit_gumbel_return_periods.py \
+    --era5-path pnw_box_era5.nc --reforecast-csv reforecast_0_t0_13.csv
 """
+
+import argparse
 
 import numpy as np
 import pandas as pd
@@ -43,7 +75,7 @@ import xarray as xr
 import matplotlib.pyplot as plt
 from scipy.stats import gumbel_r
 
-# ── Paths (matches scripts/compute_variance.py) ────────────────────────────
+# ── Defaults (matches scripts/compute_variance.py; override via CLI) ───────
 ERA5_PATH = "/network/group/aopp/predict/AWH020_AYIM_EXTREME/ERA5/era5_t2m/pnw_box_era5.nc"
 MEDIUM_RANGE_CSV = "reforecast_0_t0_13.csv"
 
@@ -52,31 +84,21 @@ OUT_BASENAME = "gumbel_return_periods"
 
 LEAD_DAY = 12  # ERA5 convergence day, see scripts/READMe.md
 
-# Target valid dates. If you have a specific list of 11 mm-dd dates, put
-# them here, e.g. TARGET_DATES = ["06-15", "06-19", ..., "07-21"] --
-# whatever's in this list is what n_years / rate below get derived from.
-# Left as None, every date in [VALID_START_MMDD, VALID_END_MMDD] is used.
-TARGET_DATES = None
-VALID_START_MMDD = "06-15"
-VALID_END_MMDD = "07-21"
+# Reforecast column to analyse. Falls back to "t2m" if this column isn't
+# present. Use "t2m" explicitly instead if you want the raw, un-bias-
+# corrected reforecast.
+REFORECAST_VALUE_COL = "adjusted_t2m"
 
 THRESHOLD_PERCENTILE = 95  # top 5%
 
-# How to convert the reforecast's pooled member-years into events/year:
-#   "unseen"     -> rate = n_exceedances / n_years. Each ensemble
-#                   member-day counts as its own draw, extending the
-#                   effective record to n_years * n_members. Matches the
-#                   "treat all data points as independent" assumption
-#                   this analysis is built on; reforecast return periods
-#                   will come out much shorter than ERA5's for the same
-#                   magnitude, which is expected under this framework.
-#   "match_era5" -> rate = (n_exceedances / n_members) / n_years. Members
-#                   only sharpen the threshold/tail estimate; the annual
-#                   occurrence rate is kept equal to ERA5's so the two
-#                   curves are directly comparable at face value.
+# See "Annual occurrence rate" in the module docstring.
 RATE_MODE = "unseen"
 
 RETURN_PERIODS_PLOT = np.logspace(0, 4, 400)  # 1-10,000 years
+
+N_BOOTSTRAP = 1000
+CI_LEVEL = 0.90  # 90% bootstrap band (5th-95th percentile)
+BOOTSTRAP_SEED = 0
 
 # Wong/Okabe-Ito colourblind-safe palette, matches plot_variance_figures.py
 COL = {"era5": "#009E73", "reforecast": "#D55E00", "reference": "#000000"}
@@ -105,36 +127,32 @@ plt.rcParams.update(
 )
 
 
-def _in_target_window(mmdd: pd.Series) -> pd.Series:
-    if TARGET_DATES is not None:
-        return mmdd.isin(TARGET_DATES)
-    return (mmdd >= VALID_START_MMDD) & (mmdd <= VALID_END_MMDD)
-
-
-def load_era5(path: str) -> pd.DataFrame:
-    """Load ERA5 t2m, subset to the target dates, return long-format df."""
-    era5 = xr.open_dataset(path)
-    df = (
-        era5.to_dataframe()
-        .reset_index()
-        .rename(columns={"time": "date", "t2m": "t2m_era5"})
-    )
-    df["date"] = pd.to_datetime(df["date"])
-    df["valid_mmdd"] = df["date"].dt.strftime("%m-%d")
-    df = df[_in_target_window(df["valid_mmdd"])].copy()
-    df["year"] = df["date"].dt.year
-    return df.dropna(subset=["t2m_era5"])
-
-
-def load_reforecast_lead(path: str, lead_day: int) -> pd.DataFrame:
-    """Load the reforecast csv, subset to one lead day and the target dates."""
+def load_reforecast_lead(path: str, lead_day: int, value_col: str) -> pd.DataFrame:
+    """Load the reforecast csv and subset to one lead day."""
     df = pd.read_csv(path)
     df["forecast_date"] = pd.to_datetime(df["forecast_date"])
     df = df[df["days"] == lead_day].copy()
     df["valid_mmdd"] = df["forecast_date"].dt.strftime("%m-%d")
-    df = df[_in_target_window(df["valid_mmdd"])].copy()
     df["year"] = df["forecast_date"].dt.year
-    return df.dropna(subset=["t2m"])
+
+    col = value_col if value_col in df.columns else "t2m"
+    df = df.rename(columns={col: "value"})
+    return df.dropna(subset=["value"])
+
+
+def load_era5(path: str, target_mmdd: set) -> pd.DataFrame:
+    """Load ERA5 t2m, subset to the given calendar (month, day) values."""
+    era5 = xr.open_dataset(path)
+    df = (
+        era5.to_dataframe()
+        .reset_index()
+        .rename(columns={"time": "date", "t2m": "value"})
+    )
+    df["date"] = pd.to_datetime(df["date"])
+    df["valid_mmdd"] = df["date"].dt.strftime("%m-%d")
+    df = df[df["valid_mmdd"].isin(target_mmdd)].copy()
+    df["year"] = df["date"].dt.year
+    return df.dropna(subset=["value"])
 
 
 def fit_pot_gumbel(
@@ -143,7 +161,7 @@ def fit_pot_gumbel(
     """
     Fit a Gumbel distribution to the top (100 - THRESHOLD_PERCENTILE)% of
     values, and derive an annual occurrence rate for those exceedances
-    under the given rate_mode. See RATE_MODE comment above.
+    under the given rate_mode. See the module docstring.
     """
     values = np.asarray(values)
     threshold = np.percentile(values, THRESHOLD_PERCENTILE)
@@ -151,9 +169,9 @@ def fit_pot_gumbel(
     m = len(exceed)
 
     if rate_mode == "unseen":
+        rate = m / (n_years * n_members)
+    elif rate_mode == "per_calendar_year":
         rate = m / n_years
-    elif rate_mode == "match_era5":
-        rate = (m / n_members) / n_years
     else:
         raise ValueError(f"unknown rate_mode: {rate_mode!r}")
 
@@ -165,13 +183,13 @@ def fit_pot_gumbel(
         "n_years": n_years,
         "n_members": n_members,
         "rate_mode": rate_mode,
-        "rate": rate,  # exceedances of `threshold` per year
+        "rate": rate,  # exceedances of `threshold` per effective year
         "loc": loc,
         "scale": scale,
     }
 
 
-def empirical_return_periods(fit: dict) -> tuple[np.ndarray, np.ndarray]:
+def empirical_return_periods(fit: dict):
     """Weibull plotting-position return periods for the raw exceedances."""
     m = fit["m"]
     ranks = np.arange(1, m + 1)
@@ -181,14 +199,83 @@ def empirical_return_periods(fit: dict) -> tuple[np.ndarray, np.ndarray]:
 
 
 def fitted_return_levels(fit: dict, return_periods: np.ndarray) -> np.ndarray:
-    """Gumbel-fit return level x(T) for each return period T (years)."""
+    """
+    Gumbel-fit return level x(T) for each return period T (years).
+
+    T below 1/rate implies an exceedance probability q = 1/(rate*T) > 1,
+    which is undefined -- there's no return level shorter than the
+    average spacing between threshold exceedances. Those points are NaN
+    (dropped by the plot) rather than clipped, which would otherwise
+    produce a spurious plunge toward the Gumbel's unbounded lower tail.
+    """
     q = 1.0 / (fit["rate"] * return_periods)  # P(X > x) implied by T
-    q = np.clip(q, 1e-12, 1 - 1e-12)
-    return gumbel_r.ppf(1 - q, loc=fit["loc"], scale=fit["scale"])
+    x = gumbel_r.ppf(1 - np.clip(q, None, 1 - 1e-12), loc=fit["loc"], scale=fit["scale"])
+    return np.where(q < 1, x, np.nan)
 
 
-def plot_return_periods(fit_era5: dict, fit_rf: dict):
+def bootstrap_return_level_ci(
+    values: np.ndarray,
+    n_years: int,
+    n_members: int,
+    rate_mode: str,
+    return_periods: np.ndarray,
+    n_boot: int = N_BOOTSTRAP,
+    ci: float = CI_LEVEL,
+    seed: int = BOOTSTRAP_SEED,
+):
+    """
+    Case-resampling bootstrap CI for the fitted return-level curve.
+
+    Each replicate resamples the pooled values with replacement (same
+    size as the original), then re-selects the top-5% threshold, refits
+    the Gumbel, and recomputes the return-level curve -- so the band
+    reflects both sampling uncertainty in the Gumbel parameters and in
+    the threshold itself. Consistent with this analysis treating all
+    pooled points as independent draws.
+    """
+    values = np.asarray(values)
+    n = len(values)
+    rng = np.random.default_rng(seed)
+    boot_levels = np.full((n_boot, len(return_periods)), np.nan)
+
+    for b in range(n_boot):
+        sample = rng.choice(values, size=n, replace=True)
+        try:
+            fit_b = fit_pot_gumbel(sample, n_years, n_members, rate_mode)
+            if fit_b["m"] < 2:
+                continue
+            boot_levels[b] = fitted_return_levels(fit_b, return_periods)
+        except Exception:
+            continue
+
+    lo_pct, hi_pct = 100 * (1 - ci) / 2, 100 * (1 + ci) / 2
+    with np.errstate(invalid="ignore"):
+        lower = np.nanpercentile(boot_levels, lo_pct, axis=0)
+        upper = np.nanpercentile(boot_levels, hi_pct, axis=0)
+    return lower, upper
+
+
+def plot_return_periods(
+    fit_era5: dict, fit_rf: dict, era5_values: np.ndarray, rf_values: np.ndarray, lead_day: int
+):
+    """
+    Return-period plot for both datasets: empirical (plotting-position)
+    points, Gumbel-fit curves, and a shaded bootstrap CI band per curve.
+    era5_values / rf_values are the full pooled arrays (not just the
+    exceedances) since the bootstrap re-selects its own threshold on
+    each resample.
+    """
     fig, ax = plt.subplots(figsize=(7.2, 4.8))
+    T_fit = RETURN_PERIODS_PLOT
+
+    for fit, values, key in (
+        (fit_era5, era5_values, "era5"),
+        (fit_rf, rf_values, "reforecast"),
+    ):
+        lower, upper = bootstrap_return_level_ci(
+            values, fit["n_years"], fit["n_members"], fit["rate_mode"], T_fit
+        )
+        ax.fill_between(T_fit, lower, upper, color=COL[key], alpha=0.15, linewidth=0, zorder=1)
 
     T_emp_era5, x_emp_era5 = empirical_return_periods(fit_era5)
     T_emp_rf, x_emp_rf = empirical_return_periods(fit_rf)
@@ -199,18 +286,19 @@ def plot_return_periods(fit_era5: dict, fit_rf: dict):
     )
     ax.scatter(
         T_emp_rf, x_emp_rf, s=10, color=COL["reforecast"], marker="o", alpha=0.5,
-        label=f"Reforecast day {LEAD_DAY} (empirical)", zorder=2,
+        label=f"Reforecast day {lead_day} (empirical)", zorder=2,
     )
 
-    T_fit = RETURN_PERIODS_PLOT
     ax.plot(
         T_fit, fitted_return_levels(fit_era5, T_fit), color=COL["era5"],
-        linewidth=1.4, label="ERA5 (Gumbel fit)",
+        linewidth=1.4, label="ERA5 (Gumbel fit)", zorder=4,
     )
     ax.plot(
         T_fit, fitted_return_levels(fit_rf, T_fit), color=COL["reforecast"],
-        linewidth=1.4, linestyle="--", label=f"Reforecast day {LEAD_DAY} (Gumbel fit)",
+        linewidth=1.4, linestyle="--", label=f"Reforecast day {lead_day} (Gumbel fit)", zorder=4,
     )
+    ax.plot([], [], color=COL["reference"], alpha=0.3, linewidth=8,
+            label=f"{int(CI_LEVEL * 100)}% bootstrap CI")
 
     ax.set_xscale("log")
     ax.set_xlabel("Return period (years)")
@@ -237,29 +325,52 @@ def summarize(name: str, fit: dict) -> dict:
     }
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--era5-path", default=ERA5_PATH)
+    p.add_argument("--reforecast-csv", default=MEDIUM_RANGE_CSV)
+    p.add_argument("--lead-day", type=int, default=LEAD_DAY)
+    p.add_argument("--value-col", default=REFORECAST_VALUE_COL)
+    p.add_argument(
+        "--rate-mode", default=RATE_MODE, choices=["unseen", "per_calendar_year"]
+    )
+    p.add_argument("--out-prefix", default=None, help="directory/prefix for outputs")
+    return p.parse_args()
+
+
 def main():
-    era5_df = load_era5(ERA5_PATH)
-    rf_df = load_reforecast_lead(MEDIUM_RANGE_CSV, LEAD_DAY)
+    args = parse_args()
+    out_csv = f"{args.out_prefix}{OUT_CSV}" if args.out_prefix else OUT_CSV
+    out_base = f"{args.out_prefix}{OUT_BASENAME}" if args.out_prefix else OUT_BASENAME
+
+    rf_df = load_reforecast_lead(args.reforecast_csv, args.lead_day, args.value_col)
+    target_mmdd = set(rf_df["valid_mmdd"].unique())
+    era5_df = load_era5(args.era5_path, target_mmdd)
 
     n_years_era5 = era5_df["year"].nunique()
     n_years_rf = rf_df["year"].nunique()
     n_members_rf = rf_df["number"].nunique()
 
-    fit_era5 = fit_pot_gumbel(era5_df["t2m_era5"].values, n_years_era5)
+    era5_values = era5_df["value"].values
+    rf_values = rf_df["value"].values
+
+    fit_era5 = fit_pot_gumbel(era5_values, n_years_era5)
     fit_rf = fit_pot_gumbel(
-        rf_df["t2m"].values, n_years_rf, n_members=n_members_rf, rate_mode=RATE_MODE
+        rf_values, n_years_rf, n_members=n_members_rf, rate_mode=args.rate_mode
     )
 
     summary = pd.DataFrame(
-        [summarize("era5", fit_era5), summarize(f"reforecast_day{LEAD_DAY}", fit_rf)]
+        [summarize("era5", fit_era5), summarize(f"reforecast_day{args.lead_day}", fit_rf)]
     )
-    summary.to_csv(OUT_CSV, index=False)
+    summary.to_csv(out_csv, index=False)
+    print(f"ERA5: n={len(era5_df)} over {n_years_era5} yr, {len(target_mmdd)} dates/yr")
+    print(f"Reforecast: n={len(rf_df)} over {n_years_rf} yr, {n_members_rf} members")
     print(summary.to_string(index=False))
 
-    fig = plot_return_periods(fit_era5, fit_rf)
-    fig.savefig(f"{OUT_BASENAME}.pdf")
-    fig.savefig(f"{OUT_BASENAME}.png")
-    print(f"\nSaved -> {OUT_CSV}, {OUT_BASENAME}.pdf, {OUT_BASENAME}.png")
+    fig = plot_return_periods(fit_era5, fit_rf, era5_values, rf_values, args.lead_day)
+    fig.savefig(f"{out_base}.pdf")
+    fig.savefig(f"{out_base}.png")
+    print(f"\nSaved -> {out_csv}, {out_base}.pdf, {out_base}.png")
 
 
 if __name__ == "__main__":
