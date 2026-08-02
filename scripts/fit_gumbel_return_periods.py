@@ -694,10 +694,18 @@ def empirical_tail_slope(values: np.ndarray, threshold_percentile: float = THRES
     Distribution-free cross-check on the POT fit: linear regression of
     ln P(X > x | X > threshold) against magnitude x, using the top
     (100 - threshold_percentile)% of values directly (Weibull plotting
-    position) -- no Gumbel/GPD assumption. The slope translates into a
-    multiplicative factor: each +1 degree multiplies the within-tail
-    exceedance probability by exp(slope), i.e. "exp(slope)x as likely per
-    +1 degree" or equivalently "1/exp(slope) x rarer per +1 degree".
+    position) -- no Gumbel/GPD assumption. slope is d(ln P)/dT (negative:
+    probability falls as magnitude rises).
+
+    Two ways to read the same +1 degree change, both derived from slope,
+    not two different degree offsets -- earlier drafts of this labeled
+    the second one "per -1 degC", which was misleading, since every use
+    of it in practice (here and in prior analysis) was still describing
+    a +1 degree step:
+      prob_ratio_per_plus1degC = exp(slope)     -- P(T+1)/P(T), < 1
+      rarity_factor_per_plus1degC = exp(-slope) -- how many times rarer
+                                                     T+1 is than T, > 1
+                                                     (= 1/prob_ratio)
     """
     values = np.asarray(values)
     threshold = np.percentile(values, threshold_percentile)
@@ -716,7 +724,7 @@ def empirical_tail_slope(values: np.ndarray, threshold_percentile: float = THRES
     return {
         "threshold": threshold, "exceedances": exceed, "log_survival": log_survival,
         "m": m, "slope": slope, "intercept": intercept, "r2": r2,
-        "factor_per_plus1degC": np.exp(slope), "factor_per_minus1degC": np.exp(-slope),
+        "prob_ratio_per_plus1degC": np.exp(slope), "rarity_factor_per_plus1degC": np.exp(-slope),
     }
 
 
@@ -751,7 +759,7 @@ def plot_empirical_slopes(
         T_line = (logP_line - fit["intercept"]) / fit["slope"]
         ax.plot(
             np.exp(logP_line), T_line, color=c, linewidth=1.4, linestyle="--",
-            label=f"{ds['name']}: {fit['factor_per_plus1degC']:.2f}x per +1$^\\circ$C (R$^2$={fit['r2']:.2f})",
+            label=f"{ds['name']}: {fit['prob_ratio_per_plus1degC']:.2f}x per +1$^\\circ$C (R$^2$={fit['r2']:.2f})",
         )
         ds["_fit"] = fit
 
@@ -951,8 +959,8 @@ def main():
         for ds in datasets:
             f = ds["_fit"]
             print(f"  {ds['name']}: m={f['m']}  slope={f['slope']:.4f}/degC  R^2={f['r2']:.3f}  "
-                  f"factor(+1degC)={f['factor_per_plus1degC']:.3f}  "
-                  f"=> {f['factor_per_minus1degC']:.2f}x rarer per +1degC")
+                  f"prob_ratio(+1degC)={f['prob_ratio_per_plus1degC']:.3f}  "
+                  f"=> {f['rarity_factor_per_plus1degC']:.2f}x rarer per +1degC")
         print(f"Saved -> {out_base}_empirical_slope.pdf, {out_base}_empirical_slope.png")
 
 
