@@ -555,10 +555,21 @@ def plot_return_periods(
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.legend(
-        frameon=True, facecolor="white", edgecolor="none", framealpha=0.85,
-        loc="upper left", fontsize=7,
-    )
+    if reference_value is not None:
+        # An in-axes legend can land right on top of the reference line/label
+        # (e.g. a high reference_value pushes the horizontal line and its
+        # text up into the legend's usual upper-left corner) -- move the
+        # legend above the axes entirely so it can never collide with
+        # anything plotted inside, regardless of where reference_value falls.
+        ax.legend(
+            frameon=True, facecolor="white", edgecolor="none", framealpha=0.85,
+            loc="lower left", bbox_to_anchor=(0, 1.02), ncol=3, fontsize=7,
+        )
+    else:
+        ax.legend(
+            frameon=True, facecolor="white", edgecolor="none", framealpha=0.85,
+            loc="upper left", fontsize=7,
+        )
     fig.tight_layout()
     return fig
 
