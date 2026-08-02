@@ -471,19 +471,22 @@ def plot_return_periods(
          f"Reforecast day {lead_day}")
     )
 
-    # Extend the return-period axis far enough to show the *nearest* curve's
-    # crossing of reference_value on-chart (curves that stay far more
-    # extreme, e.g. ERA5 vs. an unprecedented heatwave, are reported in the
-    # summary box below instead of stretching the axis by orders of
-    # magnitude to reach them).
+    # Extend the return-period axis far enough to show every curve's
+    # crossing of reference_value on-chart, up to a sanity cap (curves that
+    # stay far more extreme than the cap -- e.g. ERA5's POT fit against an
+    # unprecedented heatwave, in the hundreds of millions of years -- are
+    # reported in the summary box below instead of stretching the axis by
+    # 6+ orders of magnitude to reach them, which would crush everything
+    # else into an unreadable sliver near the left edge).
+    AXIS_EXTENSION_CAP = 1e6
     T_max_plot = RETURN_PERIODS_PLOT.max()
     if reference_value is not None:
         finite_T_ref = [
             return_period_for_value(fit, reference_value) for fit, *_ in curves
         ]
-        finite_T_ref = [t for t in finite_T_ref if np.isfinite(t)]
-        if finite_T_ref:
-            T_max_plot = max(T_max_plot, min(min(finite_T_ref) * 3, 1e6))
+        in_range = [t for t in finite_T_ref if np.isfinite(t) and t <= AXIS_EXTENSION_CAP]
+        if in_range:
+            T_max_plot = max(T_max_plot, max(in_range) * 1.3)
     T_fit = np.logspace(0, np.log10(T_max_plot), 400)
 
     fig, ax = plt.subplots(figsize=(7.2, 4.8))
