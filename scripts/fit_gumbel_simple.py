@@ -52,7 +52,7 @@ WARMING_SHIFT_DATASET = f"Reforecast day {LEAD_DAY}"
 WARMING_SHIFT_DEGREES = 1.0
 
 N_BOOTSTRAP = 1000
-CI_LEVEL = 0.90
+CI_LEVEL = 0.95
 BOOTSTRAP_SEED = 0
 
 COL = {"era5": "#ff7f0e", "era5_ci": "#ffbb78", "reforecast": "#1f77b4", "reforecast_ci": "#aec7e8",
