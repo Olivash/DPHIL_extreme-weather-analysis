@@ -368,31 +368,29 @@ def empirical_tail_slope_excl_max(values: np.ndarray, anomaly: bool = True) -> d
     }
 
 
-def bootstrap_empirical_slope_ci(values, magnitude_grid, anomaly=True, excl_max=False,
-                                  n_boot=N_BOOTSTRAP, ci=CI_LEVEL, seed=BOOTSTRAP_SEED):
+def bootstrap_empirical_slope_ci(fit, n_boot=N_BOOTSTRAP, ci=CI_LEVEL, seed=BOOTSTRAP_SEED):
     """
-    Bootstrap CI holding magnitude fixed (at magnitude_grid) and resampling the predicted
-    probability -- "how uncertain is the return period of this observed temperature."
+    Case-resampling bootstrap CI computed directly on the already-selected top-5%
+    (magnitude, log-probability) pairs: each replicate resamples indices into those m
+    pairs (not the underlying pooled record), refits the regression on the resampled
+    pairs, and evaluates the refit line at the ORIGINAL magnitudes -- "how uncertain is
+    the return period of this observed temperature, given the exceedances we picked."
+    Doesn't re-select the threshold per replicate, so it doesn't carry uncertainty from
+    the top-5% selection itself, only from the regression fit given that selection.
     """
-    values = np.asarray(values)
-    n = len(values)
+    mags, log_probs = fit["exceedances"], fit["log_survival"]
+    m = len(mags)
     rng = np.random.default_rng(seed)
-    boot_logP = np.full((n_boot, len(magnitude_grid)), np.nan)
-    fit_fn = empirical_tail_slope_excl_max if excl_max else empirical_tail_slope
+    lines = np.full((n_boot, m), np.nan)
 
     for b in range(n_boot):
-        sample = rng.choice(values, size=n, replace=True)
-        try:
-            fit_b = fit_fn(sample, anomaly=anomaly)
-            if fit_b["m"] < 2:
-                continue
-            boot_logP[b] = fit_b["slope"] * magnitude_grid + fit_b["intercept"]
-        except Exception:
-            continue
+        idx = rng.integers(0, m, size=m)
+        coeff = np.polyfit(mags[idx], log_probs[idx], 1)
+        lines[b] = np.polyval(coeff, mags)
 
     lo, hi = 100 * (1 - ci) / 2, 100 * (1 + ci) / 2
     with np.errstate(invalid="ignore"):
-        return np.nanpercentile(boot_logP, lo, axis=0), np.nanpercentile(boot_logP, hi, axis=0)
+        return np.nanpercentile(lines, lo, axis=0), np.nanpercentile(lines, hi, axis=0)
 
 
 def collect_empirical_slope_datasets(era5_values=None, rf_values=None, rf_label="Reforecast",
@@ -430,9 +428,8 @@ def plot_empirical_slopes(datasets: list, warming_shift_dataset: str = None, war
         alpha = ds.get("alpha", 1.0)
         prob = np.exp(fit["log_survival"])
 
-        mag_grid = fit["exceedances"]
-        lower_logP, upper_logP = bootstrap_empirical_slope_ci(ds["values"], mag_grid, excl_max=excl_max)
-        ax.fill_betweenx(mag_grid, np.exp(lower_logP), np.exp(upper_logP),
+        lower_logP, upper_logP = bootstrap_empirical_slope_ci(fit)
+        ax.fill_betweenx(fit["exceedances"], np.exp(lower_logP), np.exp(upper_logP),
                            color=ci_color, alpha=0.6 * alpha, linewidth=0, zorder=1)
 
         ax.scatter(prob, fit["exceedances"], s=12, color=c, marker=marker, alpha=0.6 * alpha,
