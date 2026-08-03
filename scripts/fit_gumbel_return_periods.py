@@ -152,14 +152,25 @@ GRID_COLOR = "#d3d3d3"
 # era5/reforecast match COL above; four pre-assigned slots are ready for
 # CMIP models -- add more keys here (same {"color", "ci", "marker"} shape)
 # rather than hardcoding new colors at the call site.
+#
+# CMIP slots carry a default "alpha" < 1 so they render as de-emphasized
+# background context on plot_empirical_slopes -- ERA5/reforecast (no
+# alpha key -> default 1.0 there) stay the visual foreground regardless
+# of how many CMIP lines are also shown. Override per-dataset by passing
+# an explicit "alpha" key in the dataset dict.
 MODEL_COLORS = {
     "era5": {"color": "#ff7f0e", "ci": "#ffbb78", "marker": "^"},
     "reforecast": {"color": "#1f77b4", "ci": "#aec7e8", "marker": "o"},
-    "cmip_model_1": {"color": "#2ca02c", "ci": "#98df8a", "marker": "s"},  # green
-    "cmip_model_2": {"color": "#d62728", "ci": "#ff9896", "marker": "D"},  # red
-    "cmip_model_3": {"color": "#9467bd", "ci": "#c5b0d5", "marker": "P"},  # purple
-    "cmip_model_4": {"color": "#e377c2", "ci": "#f7b6d2", "marker": "X"},  # pink
+    "cmip_model_1": {"color": "#2ca02c", "ci": "#98df8a", "marker": "s", "alpha": 0.55},  # green
+    "cmip_model_2": {"color": "#d62728", "ci": "#ff9896", "marker": "D", "alpha": 0.55},  # red
+    "cmip_model_3": {"color": "#9467bd", "ci": "#c5b0d5", "marker": "P", "alpha": 0.55},  # purple
+    "cmip_model_4": {"color": "#e377c2", "ci": "#f7b6d2", "marker": "X", "alpha": 0.55},  # pink
 }
+
+# PNW box bounds for box-averaging CMIP/AMIP model output -- confirmed
+# against the same box used for pnw_box_era5.nc (-180..180 lon convention).
+CMIP_LAT_BOUNDS = (45, 52)
+CMIP_LON_BOUNDS = (-123, -119)
 
 # ── Shared style settings (AMS/AGU-style) ───────────────────────────────
 plt.rcParams.update(
@@ -216,6 +227,35 @@ def load_era5(path: str, target_mmdd: set = None) -> pd.DataFrame:
     if target_mmdd is not None:
         df = df[df["valid_mmdd"].isin(target_mmdd)].copy()
     df["year"] = df["date"].dt.year
+    return df.dropna(subset=["value"])
+
+
+def load_cmip_model(dtree, model_name: str, target_mmdd: set, var: str = "tasmax") -> pd.DataFrame:
+    """
+    Box-average one CMIP/AMIP model's `var` field out of an xarray
+    DataTree (grouped by model name, dims member_id/time/lat/lon) over
+    the PNW box, and filter to the same calendar dates used throughout
+    this analysis so the top-5% threshold is computed over a comparable
+    set of days to ERA5/reforecast.
+
+    dtree[model_name] is expected to hold `var` with lat/lon coordinates
+    in the same -180..180 convention as CMIP_LON_BOUNDS. Units are
+    converted from Kelvin to Celsius automatically if the variable's
+    "units" attr says "K" (or is missing but values look like Kelvin).
+    """
+    da = dtree[model_name].to_dataset()[var]
+    lat_lo, lat_hi = CMIP_LAT_BOUNDS
+    lon_lo, lon_hi = CMIP_LON_BOUNDS
+    box = da.sel(lat=slice(lat_lo, lat_hi), lon=slice(lon_lo, lon_hi))
+    weights = np.cos(np.deg2rad(box["lat"]))
+    box_mean = box.weighted(weights).mean(dim=["lat", "lon"])
+    df = box_mean.to_dataframe(name="value").reset_index()
+    units = da.attrs.get("units", "").lower()
+    if units == "k" or (units == "" and df["value"].mean() > 100):
+        df["value"] = df["value"] - 273.15
+    df["valid_mmdd"] = df["time"].dt.strftime("%m-%d")
+    df["year"] = df["time"].dt.year
+    df = df[df["valid_mmdd"].isin(target_mmdd)].copy()
     return df.dropna(subset=["value"])
 
 
@@ -821,6 +861,49 @@ def bootstrap_empirical_slope_ci(
     return lower, upper
 
 
+def collect_empirical_slope_datasets(
+    era5_values: np.ndarray = None,
+    rf_values: np.ndarray = None,
+    rf_label: str = "Reforecast",
+    era5_excl_max_label: str = "ERA5 (excl. max)",
+    cmip_values: dict = None,
+) -> dict:
+    """
+    Assembles every dataset this analysis knows how to plot on the
+    empirical tail-slope chart, keyed by display name, already in the
+    {"values": ..., "color": ..., ...} shape plot_empirical_slopes wants.
+
+    Doesn't decide what gets shown -- that's a separate step, so you can
+    pick any subset (just Reforecast, just ERA5 + Reforecast, all 6/7
+    lines, etc.) without re-deriving colors/markers each time:
+        all_ds = collect_empirical_slope_datasets(era5_values, rf_values, cmip_values=cmip_values)
+        show = {"ERA5": True, "Reforecast": True, "CNRM-CM6-1": True}  # everything else omitted
+        datasets = [ds for name, ds in all_ds.items() if show.get(name, False)]
+        fig, datasets = plot_empirical_slopes(datasets)
+
+    era5_values / rf_values: full pooled arrays, or None to skip that
+    dataset (and, for era5_values, its paired "excl. max" curve) entirely.
+    cmip_values: {model_name: values_array}, assigned to MODEL_COLORS'
+    cmip_model_1, cmip_model_2, ... slots in insertion order -- add a
+    fifth+ entry to MODEL_COLORS first if you need more than 4 models.
+    """
+    all_ds = {}
+    if era5_values is not None:
+        all_ds["ERA5"] = {"name": "ERA5", **MODEL_COLORS["era5"], "values": era5_values}
+        all_ds[era5_excl_max_label] = {
+            "name": era5_excl_max_label, "color": "#555555", "marker": "s",
+            "values": era5_values, "drop_extreme": "max",
+        }
+    if rf_values is not None:
+        all_ds[rf_label] = {"name": rf_label, **MODEL_COLORS["reforecast"], "values": rf_values}
+    for i, (model_name, values) in enumerate(dict(cmip_values or {}).items(), start=1):
+        color_key = f"cmip_model_{i}"
+        if color_key not in MODEL_COLORS:
+            raise ValueError(f"no color slot left for {model_name!r} -- add one to MODEL_COLORS")
+        all_ds[model_name] = {"name": model_name, **MODEL_COLORS[color_key], "values": values}
+    return all_ds
+
+
 def plot_empirical_slopes(
     datasets: list, xlabel: str = "P(X > x | X > threshold)", ylabel: str = r"t2m ($^\circ$C)"
 ):
@@ -836,12 +919,20 @@ def plot_empirical_slopes(
         name (str), values (array), color (str), marker (str, optional),
         ci (str, optional -- CI band color, falls back to a lightened
             version of color if omitted),
+        alpha (float, optional, default 1.0 -- scales scatter/line/CI
+            opacity together; MODEL_COLORS' cmip_model_1..4 entries carry
+            alpha=0.55 by default so CMIP curves render as de-emphasized
+            background context behind ERA5/reforecast),
         threshold_percentile (float, optional, defaults to THRESHOLD_PERCENTILE),
         drop_extreme (str, optional -- "max"/"min", leave-one-out check;
             see empirical_tail_slope's docstring)
     To add a CMIP model, append another dict -- e.g.
         datasets.append({"name": "CMIP6 model A", **MODEL_COLORS["cmip_model_1"],
                           "values": cmip1_values})
+    Which datasets actually get plotted is entirely up to what's in this
+    list -- see collect_empirical_slope_datasets for building the full
+    set once and then filtering down to whichever subset you want shown.
+
     Mutates each dict in place with a "_fit" key (the empirical_tail_slope
     result) so the caller can build a summary table afterward.
     """
@@ -852,21 +943,24 @@ def plot_empirical_slopes(
         fit = empirical_tail_slope(ds["values"], threshold_percentile, drop_extreme=drop_extreme)
         c, marker = ds["color"], ds.get("marker", "o")
         ci_color = ds.get("ci", "#cccccc")
+        alpha = ds.get("alpha", 1.0)
         prob = np.exp(fit["log_survival"])
 
         logP_line = np.linspace(fit["log_survival"].min(), fit["log_survival"].max(), 100)
         lower, upper = bootstrap_empirical_slope_ci(
             ds["values"], logP_line, threshold_percentile, drop_extreme=drop_extreme
         )
-        ax.fill_between(np.exp(logP_line), lower, upper, color=ci_color, alpha=0.6, linewidth=0, zorder=1)
+        ax.fill_between(
+            np.exp(logP_line), lower, upper, color=ci_color, alpha=0.6 * alpha, linewidth=0, zorder=1
+        )
 
         ax.scatter(
-            prob, fit["exceedances"], s=12, color=c, marker=marker, alpha=0.6,
+            prob, fit["exceedances"], s=12, color=c, marker=marker, alpha=0.6 * alpha,
             label=f"{ds['name']} (empirical)", zorder=3,
         )
         T_line = (logP_line - fit["intercept"]) / fit["slope"]
         ax.plot(
-            np.exp(logP_line), T_line, color=c, linewidth=1.4, linestyle="--", zorder=4,
+            np.exp(logP_line), T_line, color=c, linewidth=1.4, linestyle="--", zorder=4, alpha=alpha,
             label=f"{ds['name']}: {fit['rarity_factor_per_plus1degC']:.2f}x rarer per +1$^\\circ$C (R$^2$={fit['r2']:.2f})",
         )
         ds["_fit"] = fit
@@ -1052,6 +1146,30 @@ def parse_args():
              "{out_base}_empirical_slope.png/.pdf",
     )
     p.add_argument(
+        "--empirical-slope-show", default=None,
+        help="comma-separated subset of dataset names to draw on the empirical-slope "
+             "plot -- any of 'ERA5', 'ERA5 (excl. max)', 'Reforecast', or a loaded CMIP "
+             "model's name (see --cmip-models). Default: everything available (ERA5 + "
+             "Reforecast, plus 'ERA5 (excl. max)' if --drop-era5-max, plus every model "
+             "in --cmip-models). e.g. --empirical-slope-show Reforecast for just one line.",
+    )
+    p.add_argument(
+        "--cmip-datatree-path", default=None,
+        help="path to an xarray DataTree (e.g. zarr store) holding CMIP/AMIP model output, "
+             "grouped by model name -- opened with xr.open_datatree(). Required to plot any "
+             "CMIP model on the empirical-slope chart.",
+    )
+    p.add_argument(
+        "--cmip-models", default=None,
+        help="comma-separated DataTree group names to load from --cmip-datatree-path and "
+             "plot, in order (mapped to MODEL_COLORS' cmip_model_1, cmip_model_2, ... slots). "
+             "e.g. --cmip-models CNRM-CM6-1,CNRM-ESM2-1,HadGEM3-GC31-LL,IPSL-CM6A-LR",
+    )
+    p.add_argument(
+        "--cmip-var", default="tasmax",
+        help="variable name to read from each CMIP model group (default: tasmax)",
+    )
+    p.add_argument(
         "--leave-one-out-slope", action="store_true",
         help="also run a leave-one-out influence check on ERA5's empirical tail slope "
              "(leave_one_out_slope_sensitivity): refit the slope with each exceedance "
@@ -1170,15 +1288,31 @@ def main():
     print(f"\nSaved -> {out_csv}, {out_base}.pdf, {out_base}.png")
 
     if args.empirical_slope_plot:
-        datasets = [
-            {"name": "ERA5", **MODEL_COLORS["era5"], "values": era5_values},
-            {"name": f"Reforecast day {args.lead_day}", **MODEL_COLORS["reforecast"], "values": rf_values},
-        ]
-        if fit_era5_sens is not None:
-            datasets.append({
-                "name": sens_label, "color": "#555555", "marker": "s",
-                "values": era5_values, "drop_extreme": "max",
-            })
+        cmip_values = {}
+        if args.cmip_models:
+            if not args.cmip_datatree_path:
+                raise ValueError("--cmip-models requires --cmip-datatree-path")
+            cmip_dtree = xr.open_datatree(args.cmip_datatree_path)
+            for model_name in [m.strip() for m in args.cmip_models.split(",") if m.strip()]:
+                cmip_df = load_cmip_model(cmip_dtree, model_name, target_mmdd, var=args.cmip_var)
+                cmip_values[model_name] = cmip_df["value"].values
+                print(f"Loaded CMIP model {model_name}: n={len(cmip_df)}")
+
+        rf_label = f"Reforecast day {args.lead_day}"
+        era5_excl_max_label = sens_label or "ERA5 (excl. max)"
+        all_datasets = collect_empirical_slope_datasets(
+            era5_values=era5_values, rf_values=rf_values, rf_label=rf_label,
+            era5_excl_max_label=era5_excl_max_label, cmip_values=cmip_values,
+        )
+
+        if args.empirical_slope_show:
+            show = {name.strip() for name in args.empirical_slope_show.split(",")}
+        else:
+            show = {"ERA5", rf_label, *cmip_values.keys()}
+            if fit_era5_sens is not None:
+                show.add(sens_label)
+        datasets = [ds for name, ds in all_datasets.items() if name in show]
+
         fig_slope, datasets = plot_empirical_slopes(datasets)
         fig_slope.savefig(f"{out_base}_empirical_slope.pdf")
         fig_slope.savefig(f"{out_base}_empirical_slope.png")
