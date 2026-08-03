@@ -286,6 +286,7 @@ def fit_pot(
     n_members: int = 1,
     rate_mode: str = "unseen",
     dist: str = "gumbel",
+    drop_extreme: str = None,
 ) -> dict:
     """
     Fit a distribution to the top (100 - THRESHOLD_PERCENTILE)% of values,
@@ -303,10 +304,32 @@ def fit_pot(
                   since GPD is the limiting distribution of threshold
                   exceedances as the threshold rises, unlike an
                   unconditional Gumbel fit to a left-truncated sample.
+
+    drop_extreme: None, "max", or "min" -- a leave-one-out sensitivity
+    check. The threshold and exceedance set are computed from `values` as
+    usual, and only *then* is the single largest ("max") or smallest
+    ("min") point in that top-5% set dropped, leaving m-1 exceedances to
+    fit. This is deliberately different from dropping a point out of
+    `values` before thresholding: with a 95th-percentile threshold over
+    ~220 points, removing one point from the full record barely shifts
+    the threshold and the exceedance count usually comes right back to
+    the same m, defeating the point of the sensitivity check. Dropping
+    from the already-selected tail is what actually tests how much the
+    fit depends on its single most (or least) extreme exceedance.
     """
     values = np.asarray(values)
     threshold = np.percentile(values, THRESHOLD_PERCENTILE)
     exceed = np.sort(values[values >= threshold])
+
+    dropped_value = None
+    if drop_extreme == "max":
+        dropped_value = exceed[-1]
+        exceed = exceed[:-1]
+    elif drop_extreme == "min":
+        dropped_value = exceed[0]
+        exceed = exceed[1:]
+    elif drop_extreme is not None:
+        raise ValueError(f"unknown drop_extreme: {drop_extreme!r}")
     m = len(exceed)
 
     if rate_mode == "unseen":
@@ -335,6 +358,8 @@ def fit_pot(
         "rate": rate,  # exceedances of `threshold` per effective year
         "dist": dist,
         "params": params,
+        "drop_extreme": drop_extreme,
+        "dropped_value": dropped_value,
     }
 
 
@@ -460,6 +485,7 @@ def bootstrap_return_level_ci(
     rate_mode: str,
     return_periods: np.ndarray,
     dist: str = "gumbel",
+    drop_extreme: str = None,
     n_boot: int = N_BOOTSTRAP,
     ci: float = CI_LEVEL,
     seed: int = BOOTSTRAP_SEED,
@@ -473,6 +499,10 @@ def bootstrap_return_level_ci(
     band reflects both sampling uncertainty in the fitted parameters and
     in the threshold itself. Consistent with this analysis treating all
     pooled points as independent draws.
+
+    drop_extreme: pass through to fit_pot on every replicate (see its
+    docstring) so a sensitivity curve's CI band is built under the same
+    leave-one-out condition as its central fit.
     """
     values = np.asarray(values)
     n = len(values)
@@ -482,7 +512,7 @@ def bootstrap_return_level_ci(
     for b in range(n_boot):
         sample = rng.choice(values, size=n, replace=True)
         try:
-            fit_b = fit_pot(sample, n_years, n_members, rate_mode, dist=dist)
+            fit_b = fit_pot(sample, n_years, n_members, rate_mode, dist=dist, drop_extreme=drop_extreme)
             if fit_b["m"] < 2:
                 continue
             boot_levels[b] = fitted_return_levels(fit_b, return_periods)
@@ -611,7 +641,8 @@ def plot_return_periods(
             lower, upper = bootstrap_return_level_ci_block_maxima(values, fit["dist"], T_fit)
         else:
             lower, upper = bootstrap_return_level_ci(
-                values, fit["n_years"], fit["n_members"], fit["rate_mode"], T_fit, dist=fit["dist"]
+                values, fit["n_years"], fit["n_members"], fit["rate_mode"], T_fit, dist=fit["dist"],
+                drop_extreme=fit.get("drop_extreme"),
             )
         ax.fill_between(T_fit, lower, upper, color=ci_color, alpha=0.6, linewidth=0, zorder=1)
 
@@ -689,7 +720,11 @@ def plot_return_periods(
     return fig
 
 
-def empirical_tail_slope(values: np.ndarray, threshold_percentile: float = THRESHOLD_PERCENTILE) -> dict:
+def empirical_tail_slope(
+    values: np.ndarray,
+    threshold_percentile: float = THRESHOLD_PERCENTILE,
+    drop_extreme: str = None,
+) -> dict:
     """
     Distribution-free cross-check on the POT fit: linear regression of
     ln P(X > x | X > threshold) against magnitude x, using the top
@@ -706,10 +741,27 @@ def empirical_tail_slope(values: np.ndarray, threshold_percentile: float = THRES
       rarity_factor_per_plus1degC = exp(-slope) -- how many times rarer
                                                      T+1 is than T, > 1
                                                      (= 1/prob_ratio)
+
+    drop_extreme: None, "max", or "min" -- same leave-one-out sensitivity
+    check as fit_pot's drop_extreme: the threshold and exceedance set are
+    computed from `values` first, and only then is the single largest or
+    smallest point *within that top-percentile set* dropped, leaving m-1
+    points for the regression. See fit_pot's docstring for why this
+    differs from dropping a point out of `values` before thresholding.
     """
     values = np.asarray(values)
     threshold = np.percentile(values, threshold_percentile)
     exceed = np.sort(values[values >= threshold])
+
+    dropped_value = None
+    if drop_extreme == "max":
+        dropped_value = exceed[-1]
+        exceed = exceed[:-1]
+    elif drop_extreme == "min":
+        dropped_value = exceed[0]
+        exceed = exceed[1:]
+    elif drop_extreme is not None:
+        raise ValueError(f"unknown drop_extreme: {drop_extreme!r}")
     m = len(exceed)
     ranks = np.arange(1, m + 1)
     survival = (m + 1 - ranks) / (m + 1)
@@ -725,6 +777,7 @@ def empirical_tail_slope(values: np.ndarray, threshold_percentile: float = THRES
         "threshold": threshold, "exceedances": exceed, "log_survival": log_survival,
         "m": m, "slope": slope, "intercept": intercept, "r2": r2,
         "prob_ratio_per_plus1degC": np.exp(slope), "rarity_factor_per_plus1degC": np.exp(-slope),
+        "drop_extreme": drop_extreme, "dropped_value": dropped_value,
     }
 
 
@@ -732,6 +785,7 @@ def bootstrap_empirical_slope_ci(
     values: np.ndarray,
     log_survival_grid: np.ndarray,
     threshold_percentile: float = THRESHOLD_PERCENTILE,
+    drop_extreme: str = None,
     n_boot: int = N_BOOTSTRAP,
     ci: float = CI_LEVEL,
     seed: int = BOOTSTRAP_SEED,
@@ -753,7 +807,7 @@ def bootstrap_empirical_slope_ci(
     for b in range(n_boot):
         sample = rng.choice(values, size=n, replace=True)
         try:
-            fit_b = empirical_tail_slope(sample, threshold_percentile)
+            fit_b = empirical_tail_slope(sample, threshold_percentile, drop_extreme=drop_extreme)
             if fit_b["m"] < 2:
                 continue
             boot_x[b] = (log_survival_grid - fit_b["intercept"]) / fit_b["slope"]
@@ -782,7 +836,9 @@ def plot_empirical_slopes(
         name (str), values (array), color (str), marker (str, optional),
         ci (str, optional -- CI band color, falls back to a lightened
             version of color if omitted),
-        threshold_percentile (float, optional, defaults to THRESHOLD_PERCENTILE)
+        threshold_percentile (float, optional, defaults to THRESHOLD_PERCENTILE),
+        drop_extreme (str, optional -- "max"/"min", leave-one-out check;
+            see empirical_tail_slope's docstring)
     To add a CMIP model, append another dict -- e.g.
         datasets.append({"name": "CMIP6 model A", **MODEL_COLORS["cmip_model_1"],
                           "values": cmip1_values})
@@ -792,13 +848,16 @@ def plot_empirical_slopes(
     fig, ax = plt.subplots(figsize=(7, 5))
     for ds in datasets:
         threshold_percentile = ds.get("threshold_percentile", THRESHOLD_PERCENTILE)
-        fit = empirical_tail_slope(ds["values"], threshold_percentile)
+        drop_extreme = ds.get("drop_extreme")
+        fit = empirical_tail_slope(ds["values"], threshold_percentile, drop_extreme=drop_extreme)
         c, marker = ds["color"], ds.get("marker", "o")
         ci_color = ds.get("ci", "#cccccc")
         prob = np.exp(fit["log_survival"])
 
         logP_line = np.linspace(fit["log_survival"].min(), fit["log_survival"].max(), 100)
-        lower, upper = bootstrap_empirical_slope_ci(ds["values"], logP_line, threshold_percentile)
+        lower, upper = bootstrap_empirical_slope_ci(
+            ds["values"], logP_line, threshold_percentile, drop_extreme=drop_extreme
+        )
         ax.fill_between(np.exp(logP_line), lower, upper, color=ci_color, alpha=0.6, linewidth=0, zorder=1)
 
         ax.scatter(
@@ -942,15 +1001,21 @@ def main():
 
     summaries = [summarize("era5", fit_era5), summarize(f"reforecast_day{args.lead_day}", fit_rf)]
 
-    fit_era5_sens, era5_sens_values, sens_label = None, None, None
+    # NOTE: drops the single highest point out of the top-5% exceedance
+    # set itself (m -> m-1), not out of the full pooled record -- see
+    # fit_pot's drop_extreme docstring. era5_values (the full record) is
+    # still what's passed along for CI bootstrapping below, since
+    # fit_pot re-derives the exceedance set (and re-applies drop_extreme)
+    # on every resample.
+    fit_era5_sens, sens_label = None, None
     if args.drop_era5_max:
-        drop_idx = np.argmax(era5_values)
-        dropped_value = era5_values[drop_idx]
-        era5_sens_values = np.delete(era5_values, drop_idx)
-        fit_era5_sens = fit_pot(era5_sens_values, n_years_era5, dist=args.dist)
+        fit_era5_sens = fit_pot(era5_values, n_years_era5, dist=args.dist, drop_extreme="max")
         sens_label = "ERA5 (excl. max)"
         summaries.append(summarize("era5_excl_max", fit_era5_sens))
-        print(f"Dropped ERA5 max: {dropped_value:.3f} (of {len(era5_values)} points)")
+        print(
+            f"Dropped ERA5 max exceedance: {fit_era5_sens['dropped_value']:.3f} "
+            f"(top-5% set had {fit_era5_sens['m'] + 1} points, now {fit_era5_sens['m']})"
+        )
 
     fit_era5_bm, era5_bm_values, bm_label = None, None, None
     if args.era5_block_maxima:
@@ -986,7 +1051,7 @@ def main():
 
     fig = plot_return_periods(
         fit_era5, fit_rf, era5_values, rf_values, args.lead_day,
-        fit_era5_sensitivity=fit_era5_sens, era5_sensitivity_values=era5_sens_values,
+        fit_era5_sensitivity=fit_era5_sens, era5_sensitivity_values=era5_values,
         sensitivity_label=sens_label,
         fit_era5_block_maxima=fit_era5_bm, era5_block_maxima_values=era5_bm_values,
         block_maxima_label=bm_label,
@@ -1002,7 +1067,10 @@ def main():
             {"name": f"Reforecast day {args.lead_day}", **MODEL_COLORS["reforecast"], "values": rf_values},
         ]
         if fit_era5_sens is not None:
-            datasets.append({"name": sens_label, "color": "#555555", "marker": "s", "values": era5_sens_values})
+            datasets.append({
+                "name": sens_label, "color": "#555555", "marker": "s",
+                "values": era5_values, "drop_extreme": "max",
+            })
         fig_slope, datasets = plot_empirical_slopes(datasets)
         fig_slope.savefig(f"{out_base}_empirical_slope.pdf")
         fig_slope.savefig(f"{out_base}_empirical_slope.png")
