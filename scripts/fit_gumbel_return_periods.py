@@ -988,6 +988,7 @@ def collect_empirical_slope_datasets(
 def plot_empirical_slopes(
     datasets: list, xlabel: str = "P(X > x | X > threshold)", ylabel: str = None,
     anomaly: bool = False,
+    warming_shift: dict = None,
 ):
     """
     empirical_tail_slope for an arbitrary list of named datasets, plotted
@@ -1020,6 +1021,21 @@ def plot_empirical_slopes(
             see empirical_tail_slope's docstring),
         anomaly (bool, optional -- overrides the plot-wide anomaly setting
             for just this dataset)
+
+    warming_shift (optional): {"dataset": <name in datasets>, "degrees" (default 1.0),
+        "reference_magnitude" (optional, defaults to that dataset's second-highest
+        exceedance -- the point just inside the most extreme one, avoiding the edge
+        instability a shift-and-compare can have right at the single most extreme
+        point), "arrow_color" (default "black"), "arrow_alpha" (default 0.4)}.
+        Draws a second, dotted overlay of one dataset's fit shifted by `degrees` --
+        "what would this look like if the whole distribution got `degrees` warmer" --
+        plus a horizontal arrow at reference_magnitude showing how far the
+        probability of reaching that magnitude moves once the shift is applied.
+        Since a fitted line here is ln P = slope*x + intercept, shifting the
+        whole distribution warmer by `degrees` is exactly a horizontal
+        translation of the fitted line by +degrees (slope unchanged, intercept
+        shifts by -slope*degrees) -- no separate fit is needed, and the arrow's
+        endpoints follow from the same closed form.
     To add a CMIP model, append another dict -- e.g.
         datasets.append({"name": "CMIP6 model A", **MODEL_COLORS["cmip_model_1"],
                           "values": cmip1_values})
@@ -1065,6 +1081,28 @@ def plot_empirical_slopes(
             label=f"{ds['name']}: {fit['rarity_factor_per_plus1degC']:.2f}x rarer per +1$^\\circ$C (R$^2$={fit['r2']:.2f})",
         )
         ds["_fit"] = fit
+
+        if warming_shift is not None and ds["name"] == warming_shift.get("dataset"):
+            degrees = warming_shift.get("degrees", 1.0)
+            T_shift_line = T_line + degrees  # horizontal translation of the same fitted line
+            ax.plot(
+                np.exp(logP_line), T_shift_line, color=c, linewidth=1.4, linestyle=":",
+                zorder=4, alpha=alpha,
+                label=f"{ds['name']} +{degrees:g}$^\\circ$C shift",
+            )
+
+            ref_mag = warming_shift.get("reference_magnitude")
+            if ref_mag is None:
+                ref_mag = fit["exceedances"][-2] if fit["m"] >= 2 else fit["exceedances"][-1]
+            logP_at_ref = fit["slope"] * ref_mag + fit["intercept"]
+            logP_shift_at_ref = fit["slope"] * (ref_mag - degrees) + fit["intercept"]
+            arrow_color = warming_shift.get("arrow_color", "black")
+            arrow_alpha = warming_shift.get("arrow_alpha", 0.4)
+            ax.annotate(
+                "", xy=(np.exp(logP_shift_at_ref), ref_mag), xytext=(np.exp(logP_at_ref), ref_mag),
+                arrowprops=dict(arrowstyle="->", color=arrow_color, lw=2, alpha=arrow_alpha),
+                annotation_clip=False, zorder=5,
+            )
     ax.plot([], [], color=COL["reference"], alpha=0.25, linewidth=8,
             label=f"{int(CI_LEVEL * 100)}% bootstrap CI")
 
@@ -1358,6 +1396,17 @@ def parse_args():
              "--no-empirical-slope-anomaly to plot absolute magnitudes instead.",
     )
     p.add_argument(
+        "--empirical-slope-warming-dataset", default=None,
+        help="draw a dotted +N degree warming-shift overlay of this one dataset (by name, "
+             "e.g. 'Reforecast day 12') on the empirical-slope plot, with a horizontal arrow "
+             "at a reference magnitude showing how the probability of reaching it moves. "
+             "See plot_empirical_slopes' warming_shift docstring. Omit to skip this overlay.",
+    )
+    p.add_argument(
+        "--empirical-slope-warming-degrees", type=float, default=1.0,
+        help="magnitude of the warming shift for --empirical-slope-warming-dataset (default: 1.0)",
+    )
+    p.add_argument(
         "--empirical-slope-show", default=None,
         help="comma-separated subset of dataset names to draw on the empirical-slope "
              "plot -- any of 'ERA5', 'ERA5 (excl. max)', 'Reforecast', or a loaded CMIP "
@@ -1534,7 +1583,15 @@ def main():
                 show.add(sens_label)
         datasets = [ds for name, ds in all_datasets.items() if name in show]
 
-        fig_slope, datasets = plot_empirical_slopes(datasets, anomaly=args.empirical_slope_anomaly)
+        warming_shift = None
+        if args.empirical_slope_warming_dataset:
+            warming_shift = {
+                "dataset": args.empirical_slope_warming_dataset,
+                "degrees": args.empirical_slope_warming_degrees,
+            }
+        fig_slope, datasets = plot_empirical_slopes(
+            datasets, anomaly=args.empirical_slope_anomaly, warming_shift=warming_shift
+        )
         fig_slope.savefig(f"{out_base}_empirical_slope.pdf")
         fig_slope.savefig(f"{out_base}_empirical_slope.png")
         print(f"\nEmpirical tail-slope cross-check ({THRESHOLD_PERCENTILE}th percentile threshold):")
