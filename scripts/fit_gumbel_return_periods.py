@@ -345,29 +345,45 @@ def fit_pot(
                   exceedances as the threshold rises, unlike an
                   unconditional Gumbel fit to a left-truncated sample.
 
-    drop_extreme: None, "max", or "min" -- a leave-one-out sensitivity
+    drop_extreme: None, "max", "min", or an int index (0-based, into the
+    ascending-sorted exceedance array) -- a leave-one-out sensitivity
     check. The threshold and exceedance set are computed from `values` as
-    usual, and only *then* is the single largest ("max") or smallest
-    ("min") point in that top-5% set dropped, leaving m-1 exceedances to
-    fit. This is deliberately different from dropping a point out of
+    usual, and only *then* is that single point dropped, leaving m-1
+    exceedances to fit ("max"/"min" are shorthand for the last/first
+    index). This is deliberately different from dropping a point out of
     `values` before thresholding: with a 95th-percentile threshold over
     ~220 points, removing one point from the full record barely shifts
     the threshold and the exceedance count usually comes right back to
     the same m, defeating the point of the sensitivity check. Dropping
     from the already-selected tail is what actually tests how much the
-    fit depends on its single most (or least) extreme exceedance.
+    fit depends on that one exceedance.
+
+    Unlike empirical_tail_slope's drop_extreme, there's no separate
+    "recompute vs. leave-one-out" choice to make here: an MLE fit (both
+    dist options) fits directly to the raw exceedance values, with no
+    rank-derived plotting positions in the loop that would need
+    recomputing for the smaller sample -- dropping a point and refitting
+    already *is* the leave-one-out operation. See
+    leave_one_out_return_level_sensitivity for looping this over every
+    point to rank each exceedance's influence on the fitted curve.
     """
     values = np.asarray(values)
     threshold = np.percentile(values, THRESHOLD_PERCENTILE)
     exceed = np.sort(values[values >= threshold])
 
     dropped_value = None
-    if drop_extreme == "max":
-        dropped_value = exceed[-1]
-        exceed = exceed[:-1]
-    elif drop_extreme == "min":
-        dropped_value = exceed[0]
-        exceed = exceed[1:]
+    if isinstance(drop_extreme, str):
+        if drop_extreme == "max":
+            idx = len(exceed) - 1
+        elif drop_extreme == "min":
+            idx = 0
+        else:
+            raise ValueError(f"unknown drop_extreme: {drop_extreme!r}")
+        dropped_value = exceed[idx]
+        exceed = np.delete(exceed, idx)
+    elif isinstance(drop_extreme, (int, np.integer)):
+        dropped_value = exceed[drop_extreme]
+        exceed = np.delete(exceed, drop_extreme)
     elif drop_extreme is not None:
         raise ValueError(f"unknown drop_extreme: {drop_extreme!r}")
     m = len(exceed)
@@ -1132,6 +1148,108 @@ def plot_leave_one_out(loo: dict, label: str = "ERA5") -> plt.Figure:
     return fig
 
 
+def leave_one_out_return_level_sensitivity(
+    values: np.ndarray,
+    n_years: int,
+    reference_value: float,
+    n_members: int = 1,
+    rate_mode: str = "unseen",
+    dist: str = "gumbel",
+) -> dict:
+    """
+    Leave-one-out influence check on the parametric POT fit (fit_pot) --
+    the return-period counterpart to leave_one_out_slope_sensitivity,
+    which does the same thing for the empirical tail-slope regression.
+
+    Refits the distribution once per exceedance, excluding that single
+    point each time (fit_pot's drop_extreme, given an explicit index),
+    and reports how far the return period implied by reference_value
+    (e.g. the 2021 PNW heatwave's observed peak) shifts. A single implied
+    return period is used as the summary statistic rather than comparing
+    entire return-level curves point-by-point, since that's usually the
+    number people actually care about (as it has been throughout this
+    analysis) and it condenses a full curve shift into one comparable
+    number per excluded point.
+
+    Unlike the empirical-slope version, there's only one way to do this
+    for an MLE fit -- see fit_pot's drop_extreme docstring for why
+    "recompute vs. leave-one-out" isn't a live question here the way it
+    is for empirical_tail_slope.
+    """
+    values = np.asarray(values)
+    fit_full = fit_pot(values, n_years, n_members, rate_mode, dist=dist)
+    T_full = return_period_for_value(fit_full, reference_value)
+
+    per_point = []
+    for i in range(fit_full["m"]):
+        fit_i = fit_pot(values, n_years, n_members, rate_mode, dist=dist, drop_extreme=i)
+        T_i = return_period_for_value(fit_i, reference_value)
+        per_point.append({
+            "magnitude": fit_full["exceedances"][i],
+            "params_without_point": fit_i["params"],
+            "rate_without_point": fit_i["rate"],
+            "return_period_without_point": T_i,
+        })
+
+    return {
+        "reference_value": reference_value,
+        "fit_full": fit_full,
+        "return_period_full": T_full,
+        "per_point": per_point,
+    }
+
+
+def print_leave_one_out_return_level(name: str, loo: dict) -> None:
+    """Console summary of leave_one_out_return_level_sensitivity, ranked by |log10 ratio|."""
+    ref = loo["reference_value"]
+    T_full = loo["return_period_full"]
+    print(f"\nLeave-one-out return-period sensitivity ({name}, reference={ref:g}):")
+    print(f"  full fit: return period = {T_full:,.1f} yr ({format_scientific(T_full)} yr)")
+
+    def _log_shift(r):
+        T = r["return_period_without_point"]
+        if not (np.isfinite(T) and np.isfinite(T_full) and T > 0 and T_full > 0):
+            return np.inf
+        return abs(np.log10(T) - np.log10(T_full))
+
+    ranked = sorted(loo["per_point"], key=_log_shift, reverse=True)
+    for r in ranked:
+        T = r["return_period_without_point"]
+        ratio = T / T_full if np.isfinite(T) and np.isfinite(T_full) and T_full > 0 else np.nan
+        print(
+            f"  drop {r['magnitude']:6.3f}: return period = {T:,.1f} yr "
+            f"({format_scientific(T)} yr, x{ratio:.2f} of full)"
+        )
+
+
+def plot_leave_one_out_return_level(loo: dict, label: str = "ERA5") -> plt.Figure:
+    """
+    Bar chart (log y-axis) of the return period implied by
+    reference_value with each point excluded in turn, against the
+    full-sample baseline (dashed line) -- the return-period counterpart
+    to plot_leave_one_out.
+    """
+    per_point = loo["per_point"]
+    mags = [r["magnitude"] for r in per_point]
+    Ts = [r["return_period_without_point"] for r in per_point]
+    max_idx = int(np.argmax(mags))
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    colors = ["#d62728" if i == max_idx else "#1f77b4" for i in range(len(mags))]
+    ax.bar([f"{m:.2f}" for m in mags], Ts, color=colors, alpha=0.8)
+    ax.axhline(loo["return_period_full"], color="black", linewidth=1.2, linestyle="--",
+               label=f"full-sample return period ({format_scientific(loo['return_period_full'])} yr)")
+    ax.set_yscale("log")
+    ax.set_xlabel(r"excluded point's magnitude ($^\circ$C)")
+    ax.set_ylabel(f"return period implied by {loo['reference_value']:g}" + r"$^\circ$C (yr)")
+    ax.set_title(f"{label}: leave-one-out return-period sensitivity (red = highest exceedance)")
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="y", which="both", color=GRID_COLOR, linewidth=0.4, zorder=0)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    return fig
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--era5-path", default=ERA5_PATH)
@@ -1214,6 +1332,15 @@ def parse_args():
              "Distinct from --drop-era5-max, which asks a different question -- see "
              "leave_one_out_slope_sensitivity's docstring. Saved as "
              "{out_base}_leave_one_out_slope.png/.pdf",
+    )
+    p.add_argument(
+        "--leave-one-out-return-level", action="store_true",
+        help="also run a leave-one-out influence check on ERA5's parametric POT fit "
+             "(leave_one_out_return_level_sensitivity): refit the Gumbel/GPD distribution "
+             "with each exceedance excluded in turn, and report how far the return period "
+             "implied by --reference-value shifts. Requires --reference-value. The "
+             "return-period counterpart to --leave-one-out-slope. Saved as "
+             "{out_base}_leave_one_out_return_level.png/.pdf",
     )
     return p.parse_args()
 
@@ -1367,6 +1494,18 @@ def main():
         fig_loo.savefig(f"{out_base}_leave_one_out_slope.pdf")
         fig_loo.savefig(f"{out_base}_leave_one_out_slope.png")
         print(f"Saved -> {out_base}_leave_one_out_slope.pdf, {out_base}_leave_one_out_slope.png")
+
+    if args.leave_one_out_return_level:
+        if args.reference_value is None:
+            raise ValueError("--leave-one-out-return-level requires --reference-value")
+        loo_rl_era5 = leave_one_out_return_level_sensitivity(
+            era5_values, n_years_era5, args.reference_value, dist=args.dist
+        )
+        print_leave_one_out_return_level("ERA5", loo_rl_era5)
+        fig_loo_rl = plot_leave_one_out_return_level(loo_rl_era5, label="ERA5")
+        fig_loo_rl.savefig(f"{out_base}_leave_one_out_return_level.pdf")
+        fig_loo_rl.savefig(f"{out_base}_leave_one_out_return_level.png")
+        print(f"Saved -> {out_base}_leave_one_out_return_level.pdf, {out_base}_leave_one_out_return_level.png")
 
 
 if __name__ == "__main__":
