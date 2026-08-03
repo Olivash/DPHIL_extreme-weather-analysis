@@ -932,6 +932,54 @@ def bootstrap_empirical_slope_ci(
     return lower, upper
 
 
+def bootstrap_empirical_slope_ci_at_magnitudes(
+    values: np.ndarray,
+    magnitude_grid: np.ndarray,
+    threshold_percentile: float = THRESHOLD_PERCENTILE,
+    drop_extreme: str = None,
+    anomaly: bool = False,
+    n_boot: int = N_BOOTSTRAP,
+    ci: float = CI_LEVEL,
+    seed: int = BOOTSTRAP_SEED,
+):
+    """
+    The other direction of bootstrap CI for empirical_tail_slope, and
+    the one the original get_top5()-based code used: instead of holding
+    probability fixed and bootstrapping magnitude
+    (bootstrap_empirical_slope_ci), this holds magnitude fixed (at
+    magnitude_grid -- typically the dataset's own observed exceedances,
+    i.e. fit["exceedances"]) and bootstraps the predicted *probability*
+    at each of those magnitudes: each replicate's refit line is
+    evaluated directly at magnitude_grid, no inversion needed.
+
+    See plot_empirical_slopes' ci_direction docstring for what these two
+    conventions mean and why they can look very different in width for
+    the exact same underlying fit.
+    """
+    values = np.asarray(values)
+    n = len(values)
+    rng = np.random.default_rng(seed)
+    boot_logP = np.full((n_boot, len(magnitude_grid)), np.nan)
+
+    for b in range(n_boot):
+        sample = rng.choice(values, size=n, replace=True)
+        try:
+            fit_b = empirical_tail_slope(
+                sample, threshold_percentile, drop_extreme=drop_extreme, anomaly=anomaly
+            )
+            if fit_b["m"] < 2:
+                continue
+            boot_logP[b] = fit_b["slope"] * magnitude_grid + fit_b["intercept"]
+        except Exception:
+            continue
+
+    lo_pct, hi_pct = 100 * (1 - ci) / 2, 100 * (1 + ci) / 2
+    with np.errstate(invalid="ignore"):
+        lower = np.nanpercentile(boot_logP, lo_pct, axis=0)
+        upper = np.nanpercentile(boot_logP, hi_pct, axis=0)
+    return lower, upper
+
+
 def collect_empirical_slope_datasets(
     era5_values: np.ndarray = None,
     rf_values: np.ndarray = None,
@@ -989,14 +1037,50 @@ def plot_empirical_slopes(
     datasets: list, xlabel: str = "P(X > x | X > threshold)", ylabel: str = None,
     anomaly: bool = False,
     warming_shift: dict = None,
+    ci_direction: str = "probability",
 ):
     """
     empirical_tail_slope for an arbitrary list of named datasets, plotted
     together: x-axis = within-tail exceedance probability (log scale,
     inverted so rarer sits to the right, matching plot_return_periods'
-    convention), y-axis = magnitude. Each fit line gets a shaded 90%
-    bootstrap CI band (bootstrap_empirical_slope_ci), matching the bands
-    already shown on the main parametric return-period plot.
+    convention), y-axis = magnitude. Each fit line gets a shaded bootstrap
+    CI band, but there are two different, non-interchangeable ways to
+    define that band -- see ci_direction.
+
+    ci_direction: "probability" (default) or "magnitude" -- which axis is
+    held fixed while bootstrapping the other:
+
+      "probability" -- holds MAGNITUDE fixed (at the dataset's own
+      observed exceedances) and bootstraps the predicted PROBABILITY at
+      each one (bootstrap_empirical_slope_ci_at_magnitudes). Answers "for
+      this observed/reference magnitude, how uncertain is the return
+      period / exceedance probability" -- e.g. "how rare was this
+      specific heatwave, with uncertainty." This is the convention the
+      original get_top5()-based code used, and never extrapolates beyond
+      the magnitudes actually in the data.
+
+      "magnitude" -- holds PROBABILITY fixed (at a grid) and bootstraps
+      the predicted MAGNITUDE at each one (bootstrap_empirical_slope_ci).
+      Answers "for this return period, how uncertain is the magnitude" --
+      the same question plot_return_periods' bands answer for the
+      parametric fit, i.e. "what's the 1-in-100-year value, with
+      uncertainty."
+
+      These are NOT mirror images of the same uncertainty -- this is the
+      classical statistics distinction between a regression's CI and its
+      *inverse* regression's CI, and they can look very different for the
+      identical fit. In particular, "magnitude" bands can balloon out
+      dramatically toward the rare end: a small disagreement in bootstrap
+      slope estimates translates into a large disagreement in *where a
+      shallow-vs-steep line crosses* a fixed low probability, i.e. an
+      extrapolation problem. "probability" bands don't have this issue
+      because they're only ever evaluated at magnitudes that were
+      actually observed -- but the same slope disagreement is still
+      there, it's just compressed by plotting probability (not magnitude)
+      as the uncertain quantity, on a log scale. Neither band is "wrong";
+      they're honest answers to two different questions, and which one
+      you want depends on whether you're asking about a magnitude or a
+      probability.
 
     anomaly: plot-wide default for empirical_tail_slope's anomaly (center
     each dataset on its own mean before thresholding -- see that
@@ -1063,13 +1147,27 @@ def plot_empirical_slopes(
         prob = np.exp(fit["log_survival"])
 
         logP_line = np.linspace(fit["log_survival"].min(), fit["log_survival"].max(), 100)
-        lower, upper = bootstrap_empirical_slope_ci(
-            ds["values"], logP_line, threshold_percentile,
-            drop_extreme=drop_extreme, anomaly=ds_anomaly,
-        )
-        ax.fill_between(
-            np.exp(logP_line), lower, upper, color=ci_color, alpha=0.6 * alpha, linewidth=0, zorder=1
-        )
+
+        if ci_direction == "probability":
+            mag_grid = fit["exceedances"]
+            lower_logP, upper_logP = bootstrap_empirical_slope_ci_at_magnitudes(
+                ds["values"], mag_grid, threshold_percentile,
+                drop_extreme=drop_extreme, anomaly=ds_anomaly,
+            )
+            ax.fill_betweenx(
+                mag_grid, np.exp(lower_logP), np.exp(upper_logP),
+                color=ci_color, alpha=0.6 * alpha, linewidth=0, zorder=1,
+            )
+        elif ci_direction == "magnitude":
+            lower, upper = bootstrap_empirical_slope_ci(
+                ds["values"], logP_line, threshold_percentile,
+                drop_extreme=drop_extreme, anomaly=ds_anomaly,
+            )
+            ax.fill_between(
+                np.exp(logP_line), lower, upper, color=ci_color, alpha=0.6 * alpha, linewidth=0, zorder=1
+            )
+        else:
+            raise ValueError(f"unknown ci_direction: {ci_direction!r}")
 
         ax.scatter(
             prob, fit["exceedances"], s=12, color=c, marker=marker, alpha=0.6 * alpha,
@@ -1396,6 +1494,17 @@ def parse_args():
              "--no-empirical-slope-anomaly to plot absolute magnitudes instead.",
     )
     p.add_argument(
+        "--empirical-slope-ci-direction", choices=["probability", "magnitude"],
+        default="probability",
+        help="which axis the empirical-slope plot's bootstrap CI bands hold fixed: "
+             "'probability' (default) evaluates uncertainty in return period/probability "
+             "at each observed magnitude (matches the original get_top5()-based code); "
+             "'magnitude' evaluates uncertainty in magnitude at each probability (matches "
+             "plot_return_periods' bands). See plot_empirical_slopes' ci_direction "
+             "docstring -- these are genuinely different questions, not two views of the "
+             "same uncertainty.",
+    )
+    p.add_argument(
         "--empirical-slope-warming-dataset", default=None,
         help="draw a dotted +N degree warming-shift overlay of this one dataset (by name, "
              "e.g. 'Reforecast day 12') on the empirical-slope plot, with a horizontal arrow "
@@ -1590,7 +1699,8 @@ def main():
                 "degrees": args.empirical_slope_warming_degrees,
             }
         fig_slope, datasets = plot_empirical_slopes(
-            datasets, anomaly=args.empirical_slope_anomaly, warming_shift=warming_shift
+            datasets, anomaly=args.empirical_slope_anomaly, warming_shift=warming_shift,
+            ci_direction=args.empirical_slope_ci_direction,
         )
         fig_slope.savefig(f"{out_base}_empirical_slope.pdf")
         fig_slope.savefig(f"{out_base}_empirical_slope.png")
