@@ -904,6 +904,104 @@ def summarize(name: str, fit: dict) -> dict:
     }
 
 
+def leave_one_out_slope_sensitivity(
+    values: np.ndarray, threshold_percentile: float = THRESHOLD_PERCENTILE
+) -> dict:
+    """
+    Regression-diagnostic answer to "how much does one point drive the
+    slope" -- distinct from empirical_tail_slope's drop_extreme, which
+    asks a different question (what if that exceedance had never
+    happened, which requires the empirical CDF itself to be recomputed
+    for a smaller sample; see that function's docstring for why the two
+    aren't interchangeable).
+
+    Here the tail's plotting positions (magnitude, log-survival) are
+    computed once for the full m-point sample and held fixed. Each point
+    is then deleted one at a time purely as a regression row -- its
+    (x, y) pair removed, everyone else's (x, y) left untouched -- and
+    the line is refit on the remaining m-1 rows. This is standard
+    leave-one-out / DFBETA-style influence analysis: it measures how
+    much *that observation's presence in the regression* pulls the
+    fitted slope away from what the rest of the points alone would
+    give, without claiming the reduced set is a valid empirical
+    distribution in its own right (it isn't -- the leftover plotting
+    positions no longer sum correctly for a sample of size m-1, which is
+    exactly why this is framed as an influence diagnostic on the
+    original m-point fit, not as a second "what-if" dataset).
+    """
+    values = np.asarray(values)
+    threshold = np.percentile(values, threshold_percentile)
+    exceed = np.sort(values[values >= threshold])
+    m = len(exceed)
+    ranks = np.arange(1, m + 1)
+    survival = (m + 1 - ranks) / (m + 1)
+    log_survival = np.log(survival)
+
+    slope_full, intercept_full = np.polyfit(exceed, log_survival, 1)
+
+    per_point = []
+    for i in range(m):
+        mask = np.arange(m) != i
+        slope_i, intercept_i = np.polyfit(exceed[mask], log_survival[mask], 1)
+        per_point.append({
+            "magnitude": exceed[i],
+            "slope_without_point": slope_i,
+            "delta_slope": slope_i - slope_full,
+            "rarity_factor_without_point": np.exp(-slope_i),
+        })
+
+    return {
+        "threshold": threshold,
+        "exceedances": exceed,
+        "log_survival": log_survival,
+        "m": m,
+        "slope_full": slope_full,
+        "intercept_full": intercept_full,
+        "rarity_factor_full": np.exp(-slope_full),
+        "per_point": per_point,
+    }
+
+
+def print_leave_one_out(name: str, loo: dict) -> None:
+    """Console summary of leave_one_out_slope_sensitivity, ranked by |delta_slope|."""
+    print(f"\nLeave-one-out slope sensitivity ({name}, m={loo['m']}):")
+    print(f"  full fit: slope={loo['slope_full']:.4f}  rarity_factor={loo['rarity_factor_full']:.3f}")
+    ranked = sorted(loo["per_point"], key=lambda r: abs(r["delta_slope"]), reverse=True)
+    for r in ranked:
+        pct = 100 * r["delta_slope"] / loo["slope_full"]
+        print(
+            f"  drop {r['magnitude']:6.3f}: slope={r['slope_without_point']:+.4f} "
+            f"(Delta={r['delta_slope']:+.4f}, {pct:+.1f}%)  "
+            f"rarity_factor={r['rarity_factor_without_point']:.3f}"
+        )
+
+
+def plot_leave_one_out(loo: dict, label: str = "ERA5") -> plt.Figure:
+    """
+    Bar chart of the fitted slope with each point excluded in turn,
+    against the full-sample baseline (dashed line) -- visualizes which
+    single exceedance the regression's slope is most sensitive to.
+    """
+    per_point = loo["per_point"]
+    mags = [r["magnitude"] for r in per_point]
+    slopes = [r["slope_without_point"] for r in per_point]
+    max_idx = int(np.argmax(mags))
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    colors = ["#d62728" if i == max_idx else "#1f77b4" for i in range(len(mags))]
+    ax.bar([f"{m:.2f}" for m in mags], slopes, color=colors, alpha=0.8)
+    ax.axhline(loo["slope_full"], color="black", linewidth=1.2, linestyle="--",
+               label=f"full-sample slope ({loo['slope_full']:.3f})")
+    ax.set_xlabel(r"excluded point's magnitude ($^\circ$C)")
+    ax.set_ylabel("slope with that point excluded")
+    ax.set_title(f"{label}: leave-one-out slope sensitivity (red = highest exceedance)")
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="y", color=GRID_COLOR, linewidth=0.6, zorder=0)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    return fig
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--era5-path", default=ERA5_PATH)
@@ -952,6 +1050,16 @@ def parse_args():
         help="also produce a distribution-free tail-slope cross-check plot "
              "(empirical_tail_slope / plot_empirical_slopes), saved as "
              "{out_base}_empirical_slope.png/.pdf",
+    )
+    p.add_argument(
+        "--leave-one-out-slope", action="store_true",
+        help="also run a leave-one-out influence check on ERA5's empirical tail slope "
+             "(leave_one_out_slope_sensitivity): refit the slope with each exceedance "
+             "excluded in turn, holding everyone else's plotting position fixed, to see "
+             "how much any single point (esp. the highest) drives the fitted slope. "
+             "Distinct from --drop-era5-max, which asks a different question -- see "
+             "leave_one_out_slope_sensitivity's docstring. Saved as "
+             "{out_base}_leave_one_out_slope.png/.pdf",
     )
     return p.parse_args()
 
@@ -1081,6 +1189,14 @@ def main():
                   f"prob_ratio(+1degC)={f['prob_ratio_per_plus1degC']:.3f}  "
                   f"=> {f['rarity_factor_per_plus1degC']:.2f}x rarer per +1degC")
         print(f"Saved -> {out_base}_empirical_slope.pdf, {out_base}_empirical_slope.png")
+
+    if args.leave_one_out_slope:
+        loo_era5 = leave_one_out_slope_sensitivity(era5_values)
+        print_leave_one_out("ERA5", loo_era5)
+        fig_loo = plot_leave_one_out(loo_era5, label="ERA5")
+        fig_loo.savefig(f"{out_base}_leave_one_out_slope.pdf")
+        fig_loo.savefig(f"{out_base}_leave_one_out_slope.png")
+        print(f"Saved -> {out_base}_leave_one_out_slope.pdf, {out_base}_leave_one_out_slope.png")
 
 
 if __name__ == "__main__":
