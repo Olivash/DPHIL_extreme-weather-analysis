@@ -659,7 +659,7 @@ def plot_return_periods(
     curves = [(fit_era5, era5_values, COL["era5"], COL["era5_ci"], "-", "ERA5")]
     if fit_era5_sensitivity is not None:
         curves.append(
-            (fit_era5_sensitivity, era5_sensitivity_values, "#555555", "#cccccc", ":",
+            (fit_era5_sensitivity, era5_sensitivity_values, COL["era5"], "#cccccc", ":",
              sensitivity_label or "ERA5 (sensitivity)")
         )
     if fit_era5_block_maxima is not None:
@@ -933,11 +933,7 @@ def bootstrap_empirical_slope_ci(
 
 
 def bootstrap_empirical_slope_ci_at_magnitudes(
-    values: np.ndarray,
-    magnitude_grid: np.ndarray,
-    threshold_percentile: float = THRESHOLD_PERCENTILE,
-    drop_extreme: str = None,
-    anomaly: bool = False,
+    fit: dict,
     n_boot: int = N_BOOTSTRAP,
     ci: float = CI_LEVEL,
     seed: int = BOOTSTRAP_SEED,
@@ -946,37 +942,36 @@ def bootstrap_empirical_slope_ci_at_magnitudes(
     The other direction of bootstrap CI for empirical_tail_slope, and
     the one the original get_top5()-based code used: instead of holding
     probability fixed and bootstrapping magnitude
-    (bootstrap_empirical_slope_ci), this holds magnitude fixed (at
-    magnitude_grid -- typically the dataset's own observed exceedances,
-    i.e. fit["exceedances"]) and bootstraps the predicted *probability*
-    at each of those magnitudes: each replicate's refit line is
-    evaluated directly at magnitude_grid, no inversion needed.
+    (bootstrap_empirical_slope_ci), this holds magnitude fixed (at the
+    dataset's own already-selected exceedances, fit["exceedances"]) and
+    bootstraps the predicted *probability* at each of those magnitudes.
+
+    Matches bootstrap_confidence_intervals from the original code exactly:
+    each replicate resamples indices into the m already-selected
+    (magnitude, log-probability) pairs (not the underlying pooled record,
+    and without re-selecting the threshold), refits the regression on the
+    resampled pairs, and evaluates the refit line at the ORIGINAL
+    magnitudes. Doesn't carry uncertainty from the top-5% selection
+    itself, only from the regression fit given that selection.
 
     See plot_empirical_slopes' ci_direction docstring for what these two
     conventions mean and why they can look very different in width for
     the exact same underlying fit.
     """
-    values = np.asarray(values)
-    n = len(values)
+    mags, log_probs = fit["exceedances"], fit["log_survival"]
+    m = len(mags)
     rng = np.random.default_rng(seed)
-    boot_logP = np.full((n_boot, len(magnitude_grid)), np.nan)
+    lines = np.full((n_boot, m), np.nan)
 
     for b in range(n_boot):
-        sample = rng.choice(values, size=n, replace=True)
-        try:
-            fit_b = empirical_tail_slope(
-                sample, threshold_percentile, drop_extreme=drop_extreme, anomaly=anomaly
-            )
-            if fit_b["m"] < 2:
-                continue
-            boot_logP[b] = fit_b["slope"] * magnitude_grid + fit_b["intercept"]
-        except Exception:
-            continue
+        idx = rng.integers(0, m, size=m)
+        coeff = np.polyfit(mags[idx], log_probs[idx], 1)
+        lines[b] = np.polyval(coeff, mags)
 
     lo_pct, hi_pct = 100 * (1 - ci) / 2, 100 * (1 + ci) / 2
     with np.errstate(invalid="ignore"):
-        lower = np.nanpercentile(boot_logP, lo_pct, axis=0)
-        upper = np.nanpercentile(boot_logP, hi_pct, axis=0)
+        lower = np.nanpercentile(lines, lo_pct, axis=0)
+        upper = np.nanpercentile(lines, hi_pct, axis=0)
     return lower, upper
 
 
@@ -1020,7 +1015,8 @@ def collect_empirical_slope_datasets(
     if era5_values is not None:
         all_ds["ERA5"] = {"name": "ERA5", **MODEL_COLORS["era5"], "values": era5_values}
         all_ds[era5_excl_max_label] = {
-            "name": era5_excl_max_label, "color": "#555555", "marker": "s",
+            "name": era5_excl_max_label, "color": MODEL_COLORS["era5"]["color"],
+            "ci": "#cccccc", "marker": "s", "linestyle": ":",
             "values": era5_values, "drop_extreme": "max_loo",
         }
     if rf_values is not None:
@@ -1143,6 +1139,7 @@ def plot_empirical_slopes(
         )
         c, marker = ds["color"], ds.get("marker", "o")
         ci_color = ds.get("ci", "#cccccc")
+        linestyle = ds.get("linestyle", "--")
         alpha = ds.get("alpha", 1.0)
         prob = np.exp(fit["log_survival"])
 
@@ -1150,10 +1147,7 @@ def plot_empirical_slopes(
 
         if ci_direction == "probability":
             mag_grid = fit["exceedances"]
-            lower_logP, upper_logP = bootstrap_empirical_slope_ci_at_magnitudes(
-                ds["values"], mag_grid, threshold_percentile,
-                drop_extreme=drop_extreme, anomaly=ds_anomaly,
-            )
+            lower_logP, upper_logP = bootstrap_empirical_slope_ci_at_magnitudes(fit)
             ax.fill_betweenx(
                 mag_grid, np.exp(lower_logP), np.exp(upper_logP),
                 color=ci_color, alpha=0.6 * alpha, linewidth=0, zorder=1,
@@ -1175,7 +1169,7 @@ def plot_empirical_slopes(
         )
         T_line = (logP_line - fit["intercept"]) / fit["slope"]
         ax.plot(
-            np.exp(logP_line), T_line, color=c, linewidth=1.4, linestyle="--", zorder=4, alpha=alpha,
+            np.exp(logP_line), T_line, color=c, linewidth=1.4, linestyle=linestyle, zorder=4, alpha=alpha,
             label=f"{ds['name']}: {fit['rarity_factor_per_plus1degC']:.2f}x rarer per +1$^\\circ$C (R$^2$={fit['r2']:.2f})",
         )
         ds["_fit"] = fit

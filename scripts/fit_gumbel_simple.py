@@ -31,8 +31,8 @@ import matplotlib.pyplot as plt
 from scipy.stats import gumbel_r, genpareto
 
 # ── Config ───────────────────────────────────────────────────────────────────
-ERA5_PATH = "/root/.claude/uploads/9dce1728-1f2f-5d2f-95e1-adcb177ca3c6/9ffea068-pnw_box_era5_filtered.nc"
-REFORECAST_CSV = "/root/.claude/uploads/9dce1728-1f2f-5d2f-95e1-adcb177ca3c6/109dbe8b-refore.csv"
+ERA5_PATH = "../station/pnw_box_era5_filtered.nc"
+REFORECAST_CSV = "../refore.csv"
 LEAD_DAY = 12
 
 DIST = "gumbel"  # "gumbel" or "gpd"
@@ -44,15 +44,17 @@ REFERENCE_LABEL = "2021 PNW heatwave"
 # Optional CMIP/AMIP models. CMIP_DATATREE_PATH=None skips CMIP entirely; set it and list
 # the DataTree group names you want in CMIP_MODEL_NAMES to load them (done in main(), after
 # target_mmdd is known -- can't be filled in up here since target_mmdd doesn't exist yet).
-CMIP_DATATREE_PATH = None  # e.g. "path/to/your/datatree"
+CMIP_DATATREE_PATH = "../New_folder/global_temp_anomaly.zarr/"
+CMIP_ENGINE = "zarr"  # passed to xr.open_datatree -- needed for a zarr store, not needed for netcdf
 CMIP_MODEL_NAMES = ["CNRM-CM6-1", "CNRM-ESM2-1", "HadGEM3-GC31-LL", "IPSL-CM6A-LR"]
+CMIP_VAR = "tasmax"
 
 # Warming-shift arrow on the empirical-slope plot (None to skip)
 WARMING_SHIFT_DATASET = f"Reforecast day {LEAD_DAY}"
 WARMING_SHIFT_DEGREES = 1.0
 
 N_BOOTSTRAP = 1000
-CI_LEVEL = 0.95
+CI_LEVEL = 0.90
 BOOTSTRAP_SEED = 0
 
 COL = {"era5": "#ff7f0e", "era5_ci": "#ffbb78", "reforecast": "#1f77b4", "reforecast_ci": "#aec7e8",
@@ -61,10 +63,10 @@ GRID_COLOR = "#d3d3d3"
 MODEL_COLORS = {
     "era5": {"color": "#ff7f0e", "ci": "#ffbb78", "marker": "^"},
     "reforecast": {"color": "#1f77b4", "ci": "#aec7e8", "marker": "o"},
-    "cmip_model_1": {"color": "#2ca02c", "ci": "#98df8a", "marker": "s", "alpha": 0.55},
-    "cmip_model_2": {"color": "#d62728", "ci": "#ff9896", "marker": "D", "alpha": 0.55},
-    "cmip_model_3": {"color": "#9467bd", "ci": "#c5b0d5", "marker": "P", "alpha": 0.55},
-    "cmip_model_4": {"color": "#e377c2", "ci": "#f7b6d2", "marker": "X", "alpha": 0.55},
+    "cmip_model_1": {"color": "#2ca02c", "ci": "#984ea3", "marker": "o", "alpha": 0.4},
+    "cmip_model_2": {"color": "#d62728", "ci": "#ff7f00", "marker": "o", "alpha": 0.4},
+    "cmip_model_3": {"color": "#9467bd", "ci": "#377eb8", "marker": "o", "alpha": 0.4},
+    "cmip_model_4": {"color": "#e377c2", "ci": "#a65628", "marker": "o", "alpha": 0.4},
 }
 CMIP_LAT_BOUNDS = (45, 52)
 CMIP_LON_BOUNDS = (-123, -119)
@@ -487,7 +489,13 @@ def main():
     n_years_rf = rf_df["year"].nunique()
     n_members_rf = rf_df["number"].nunique()
     era5_values = era5_df["value"].values
-    rf_values = rf_df["value"].values
+    # NOTE: uses the csv's own "adjusted_t2m" column, not the properly bias-corrected
+    # "value" column that apply_bias() just computed above -- adjusted_t2m is the
+    # lead-0-derived regression correction that this whole analysis found invalid at
+    # lead 12 (see the module docstring / "Reforecast bias correction" discussion).
+    # Kept as-is to match the configuration this was explicitly set to; switch to
+    # rf_df["value"].values to use the corrected column instead.
+    rf_values = rf_df["adjusted_t2m"].values
 
     fit_era5 = fit_pot(era5_values, n_years_era5)
     fit_era5_excl_max = fit_pot_excl_max(era5_values, n_years_era5)
@@ -511,9 +519,9 @@ def main():
 
     cmip_values = {}
     if CMIP_DATATREE_PATH is not None:
-        cmip_dtree = xr.open_datatree(CMIP_DATATREE_PATH)
+        cmip_dtree = xr.open_datatree(CMIP_DATATREE_PATH, engine=CMIP_ENGINE)
         for name in CMIP_MODEL_NAMES:
-            cmip_values[name] = load_cmip_model(cmip_dtree, name, target_mmdd)["value"].values
+            cmip_values[name] = load_cmip_model(cmip_dtree, name, target_mmdd, var=CMIP_VAR)["value"].values
             print(f"Loaded CMIP model {name}: n={len(cmip_values[name])}")
 
     all_datasets = collect_empirical_slope_datasets(
