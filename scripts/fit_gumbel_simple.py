@@ -247,7 +247,7 @@ def plot_return_periods(fit_era5, fit_rf, era5_values, rf_values, lead_day,
     """Return-period plot: empirical points, fitted curves, bootstrap CI bands, reference line."""
     curves = [(fit_era5, era5_values, COL["era5"], COL["era5_ci"], "-", "ERA5", False)]
     if fit_era5_excl_max is not None:
-        curves.append((fit_era5_excl_max, era5_values, "#555555", "#cccccc", ":", "ERA5 (excl. max)", True))
+        curves.append((fit_era5_excl_max, era5_values, COL["era5"], "#cccccc", ":", "ERA5 (excl. max)", True))
     curves.append((fit_rf, rf_values, COL["reforecast"], COL["reforecast_ci"], "--",
                     f"Reforecast day {lead_day}", False))
 
@@ -398,7 +398,8 @@ def collect_empirical_slope_datasets(era5_values=None, rf_values=None, rf_label=
     if era5_values is not None:
         all_ds["ERA5"] = {"name": "ERA5", **MODEL_COLORS["era5"], "values": era5_values, "excl_max": False}
         all_ds["ERA5 (excl. max)"] = {
-            "name": "ERA5 (excl. max)", "color": "#555555", "marker": "s",
+            "name": "ERA5 (excl. max)", "color": MODEL_COLORS["era5"]["color"],
+            "ci": "#cccccc", "marker": "s", "linestyle": ":",
             "values": era5_values, "excl_max": True,
         }
     if rf_values is not None:
@@ -423,6 +424,7 @@ def plot_empirical_slopes(datasets: list, warming_shift_dataset: str = None, war
         fit = fit_fn(ds["values"])
         c, marker = ds["color"], ds.get("marker", "o")
         ci_color = ds.get("ci", "#cccccc")
+        linestyle = ds.get("linestyle", "--")
         alpha = ds.get("alpha", 1.0)
         prob = np.exp(fit["log_survival"])
 
@@ -434,7 +436,7 @@ def plot_empirical_slopes(datasets: list, warming_shift_dataset: str = None, war
                     label=f"{ds['name']} (empirical)", zorder=3)
         logP_line = np.linspace(fit["log_survival"].min(), fit["log_survival"].max(), 100)
         T_line = (logP_line - fit["intercept"]) / fit["slope"]
-        ax.plot(np.exp(logP_line), T_line, color=c, linewidth=1.4, linestyle="--", zorder=4, alpha=alpha,
+        ax.plot(np.exp(logP_line), T_line, color=c, linewidth=1.4, linestyle=linestyle, zorder=4, alpha=alpha,
                  label=f"{ds['name']}: {fit['rarity_factor_per_plus1degC']:.2f}x rarer per +1$^\\circ$C "
                        f"(R$^2$={fit['r2']:.2f})")
 
