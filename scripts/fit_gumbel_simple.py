@@ -41,13 +41,11 @@ THRESHOLD_PERCENTILE = 95  # top 5%
 REFERENCE_VALUE = 39.5  # 2021 PNW heatwave observed peak (degC)
 REFERENCE_LABEL = "2021 PNW heatwave"
 
-# Optional CMIP/AMIP models: {model_name: values_array}. Leave empty to skip.
-# Fill this in yourself, e.g.:
-#   import xarray as xr
-#   cmip_dtree = xr.open_datatree("path/to/your/datatree")
-#   CMIP_MODELS = {name: load_cmip_model(cmip_dtree, name, target_mmdd)["value"].values
-#                  for name in ["CNRM-CM6-1", "CNRM-ESM2-1", "HadGEM3-GC31-LL", "IPSL-CM6A-LR"]}
-CMIP_MODELS = {}
+# Optional CMIP/AMIP models. CMIP_DATATREE_PATH=None skips CMIP entirely; set it and list
+# the DataTree group names you want in CMIP_MODEL_NAMES to load them (done in main(), after
+# target_mmdd is known -- can't be filled in up here since target_mmdd doesn't exist yet).
+CMIP_DATATREE_PATH = None  # e.g. "path/to/your/datatree"
+CMIP_MODEL_NAMES = ["CNRM-CM6-1", "CNRM-ESM2-1", "HadGEM3-GC31-LL", "IPSL-CM6A-LR"]
 
 # Warming-shift arrow on the empirical-slope plot (None to skip)
 WARMING_SHIFT_DATASET = f"Reforecast day {LEAD_DAY}"
@@ -509,9 +507,16 @@ def main():
     fig.savefig("gumbel_return_periods.png")
     print("Saved -> gumbel_return_periods.pdf/.png")
 
+    cmip_values = {}
+    if CMIP_DATATREE_PATH is not None:
+        cmip_dtree = xr.open_datatree(CMIP_DATATREE_PATH)
+        for name in CMIP_MODEL_NAMES:
+            cmip_values[name] = load_cmip_model(cmip_dtree, name, target_mmdd)["value"].values
+            print(f"Loaded CMIP model {name}: n={len(cmip_values[name])}")
+
     all_datasets = collect_empirical_slope_datasets(
         era5_values=era5_values, rf_values=rf_values, rf_label=f"Reforecast day {LEAD_DAY}",
-        cmip_values=CMIP_MODELS,
+        cmip_values=cmip_values,
     )
     fig_slope, datasets = plot_empirical_slopes(
         list(all_datasets.values()),
