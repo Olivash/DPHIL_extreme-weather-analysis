@@ -782,30 +782,56 @@ def empirical_tail_slope(
                                                      T+1 is than T, > 1
                                                      (= 1/prob_ratio)
 
-    drop_extreme: None, "max", or "min" -- same leave-one-out sensitivity
-    check as fit_pot's drop_extreme: the threshold and exceedance set are
-    computed from `values` first, and only then is the single largest or
-    smallest point *within that top-percentile set* dropped, leaving m-1
-    points for the regression. See fit_pot's docstring for why this
-    differs from dropping a point out of `values` before thresholding.
+    drop_extreme: None, or one of "max"/"min"/"max_loo"/"min_loo" -- two
+    different sensitivity checks, both dropping the single largest
+    ("max") or smallest ("min") point in the top-percentile set, but
+    disagreeing on what happens to the *other* points' plotting
+    positions:
+
+      "max"/"min" -- recompute: the empirical CDF is rebuilt from
+      scratch for the smaller (m-1)-point sample, i.e. "what would the
+      tail look like if there had only ever been m-1 such exceedances."
+      Same convention as fit_pot's drop_extreme -- see its docstring.
+
+      "max_loo"/"min_loo" -- leave-one-out: plotting positions are
+      computed once for the full m-point sample and held fixed; only
+      the target point's regression row is deleted, everyone else's
+      (x, y) left untouched. Answers a different question -- "how much
+      does that one point's presence in the regression pull the fitted
+      slope" -- and is the same computation as
+      leave_one_out_slope_sensitivity's per-point check, specialized to
+      the max/min case. The two conventions can legitimately give
+      different numbers for "drop the max" on the same data; neither is
+      more "correct" in general, they just answer different questions.
     """
     values = np.asarray(values)
     threshold = np.percentile(values, threshold_percentile)
-    exceed = np.sort(values[values >= threshold])
+    exceed_full = np.sort(values[values >= threshold])
+    m_full = len(exceed_full)
+    ranks_full = np.arange(1, m_full + 1)
+    log_survival_full = np.log((m_full + 1 - ranks_full) / (m_full + 1))
 
     dropped_value = None
-    if drop_extreme == "max":
-        dropped_value = exceed[-1]
-        exceed = exceed[:-1]
-    elif drop_extreme == "min":
-        dropped_value = exceed[0]
-        exceed = exceed[1:]
-    elif drop_extreme is not None:
+    if drop_extreme is None:
+        exceed, log_survival = exceed_full, log_survival_full
+    elif drop_extreme in ("max", "min"):
+        if drop_extreme == "max":
+            dropped_value = exceed_full[-1]
+            exceed = exceed_full[:-1]
+        else:
+            dropped_value = exceed_full[0]
+            exceed = exceed_full[1:]
+        m = len(exceed)
+        ranks = np.arange(1, m + 1)
+        log_survival = np.log((m + 1 - ranks) / (m + 1))
+    elif drop_extreme in ("max_loo", "min_loo"):
+        idx = m_full - 1 if drop_extreme == "max_loo" else 0
+        dropped_value = exceed_full[idx]
+        keep = np.arange(m_full) != idx
+        exceed, log_survival = exceed_full[keep], log_survival_full[keep]
+    else:
         raise ValueError(f"unknown drop_extreme: {drop_extreme!r}")
     m = len(exceed)
-    ranks = np.arange(1, m + 1)
-    survival = (m + 1 - ranks) / (m + 1)
-    log_survival = np.log(survival)
 
     slope, intercept = np.polyfit(exceed, log_survival, 1)
     pred = slope * exceed + intercept
@@ -883,6 +909,16 @@ def collect_empirical_slope_datasets(
 
     era5_values / rf_values: full pooled arrays, or None to skip that
     dataset (and, for era5_values, its paired "excl. max" curve) entirely.
+    The "excl. max" curve uses empirical_tail_slope's "max_loo" (leave-
+    one-out) convention -- the max exceedance's regression row is
+    dropped but every other point's plotting position is left exactly
+    as computed for the full 11-point sample -- not "max" (which rebuilds
+    the empirical CDF from scratch for a 10-point sample). The two give
+    different numbers for the same "drop ERA5's max" question; "max_loo"
+    is what's plotted here since it's the one that answers "how much
+    does that single point drive the slope," matching
+    leave_one_out_slope_sensitivity. Pass a different drop_extreme by
+    building that entry yourself if you want the other convention.
     cmip_values: {model_name: values_array}, assigned to MODEL_COLORS'
     cmip_model_1, cmip_model_2, ... slots in insertion order -- add a
     fifth+ entry to MODEL_COLORS first if you need more than 4 models.
@@ -892,7 +928,7 @@ def collect_empirical_slope_datasets(
         all_ds["ERA5"] = {"name": "ERA5", **MODEL_COLORS["era5"], "values": era5_values}
         all_ds[era5_excl_max_label] = {
             "name": era5_excl_max_label, "color": "#555555", "marker": "s",
-            "values": era5_values, "drop_extreme": "max",
+            "values": era5_values, "drop_extreme": "max_loo",
         }
     if rf_values is not None:
         all_ds[rf_label] = {"name": rf_label, **MODEL_COLORS["reforecast"], "values": rf_values}
