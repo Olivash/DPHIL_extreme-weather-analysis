@@ -728,6 +728,45 @@ def empirical_tail_slope(values: np.ndarray, threshold_percentile: float = THRES
     }
 
 
+def bootstrap_empirical_slope_ci(
+    values: np.ndarray,
+    log_survival_grid: np.ndarray,
+    threshold_percentile: float = THRESHOLD_PERCENTILE,
+    n_boot: int = N_BOOTSTRAP,
+    ci: float = CI_LEVEL,
+    seed: int = BOOTSTRAP_SEED,
+):
+    """
+    Case-resampling bootstrap CI for an empirical_tail_slope() fit line,
+    the same pattern as bootstrap_return_level_ci but for the
+    distribution-free regression instead of a parametric fit: each
+    replicate resamples the pooled values with replacement, re-selects
+    the top-percentile threshold, refits the ln(P) vs. magnitude
+    regression, and evaluates it at the given log_survival_grid (the
+    same x grid the caller is about to plot the central fit line on).
+    """
+    values = np.asarray(values)
+    n = len(values)
+    rng = np.random.default_rng(seed)
+    boot_x = np.full((n_boot, len(log_survival_grid)), np.nan)
+
+    for b in range(n_boot):
+        sample = rng.choice(values, size=n, replace=True)
+        try:
+            fit_b = empirical_tail_slope(sample, threshold_percentile)
+            if fit_b["m"] < 2:
+                continue
+            boot_x[b] = (log_survival_grid - fit_b["intercept"]) / fit_b["slope"]
+        except Exception:
+            continue
+
+    lo_pct, hi_pct = 100 * (1 - ci) / 2, 100 * (1 + ci) / 2
+    with np.errstate(invalid="ignore"):
+        lower = np.nanpercentile(boot_x, lo_pct, axis=0)
+        upper = np.nanpercentile(boot_x, hi_pct, axis=0)
+    return lower, upper
+
+
 def plot_empirical_slopes(
     datasets: list, xlabel: str = "P(X > x | X > threshold)", ylabel: str = r"t2m ($^\circ$C)"
 ):
@@ -735,10 +774,14 @@ def plot_empirical_slopes(
     empirical_tail_slope for an arbitrary list of named datasets, plotted
     together: x-axis = within-tail exceedance probability (log scale,
     inverted so rarer sits to the right, matching plot_return_periods'
-    convention), y-axis = magnitude.
+    convention), y-axis = magnitude. Each fit line gets a shaded 90%
+    bootstrap CI band (bootstrap_empirical_slope_ci), matching the bands
+    already shown on the main parametric return-period plot.
 
     datasets: list of dicts, each with keys:
         name (str), values (array), color (str), marker (str, optional),
+        ci (str, optional -- CI band color, falls back to a lightened
+            version of color if omitted),
         threshold_percentile (float, optional, defaults to THRESHOLD_PERCENTILE)
     To add a CMIP model, append another dict -- e.g.
         datasets.append({"name": "CMIP6 model A", **MODEL_COLORS["cmip_model_1"],
@@ -748,20 +791,28 @@ def plot_empirical_slopes(
     """
     fig, ax = plt.subplots(figsize=(7, 5))
     for ds in datasets:
-        fit = empirical_tail_slope(ds["values"], ds.get("threshold_percentile", THRESHOLD_PERCENTILE))
+        threshold_percentile = ds.get("threshold_percentile", THRESHOLD_PERCENTILE)
+        fit = empirical_tail_slope(ds["values"], threshold_percentile)
         c, marker = ds["color"], ds.get("marker", "o")
+        ci_color = ds.get("ci", "#cccccc")
         prob = np.exp(fit["log_survival"])
+
+        logP_line = np.linspace(fit["log_survival"].min(), fit["log_survival"].max(), 100)
+        lower, upper = bootstrap_empirical_slope_ci(ds["values"], logP_line, threshold_percentile)
+        ax.fill_between(np.exp(logP_line), lower, upper, color=ci_color, alpha=0.6, linewidth=0, zorder=1)
+
         ax.scatter(
             prob, fit["exceedances"], s=12, color=c, marker=marker, alpha=0.6,
-            label=f"{ds['name']} (empirical)",
+            label=f"{ds['name']} (empirical)", zorder=3,
         )
-        logP_line = np.linspace(fit["log_survival"].min(), fit["log_survival"].max(), 100)
         T_line = (logP_line - fit["intercept"]) / fit["slope"]
         ax.plot(
-            np.exp(logP_line), T_line, color=c, linewidth=1.4, linestyle="--",
+            np.exp(logP_line), T_line, color=c, linewidth=1.4, linestyle="--", zorder=4,
             label=f"{ds['name']}: {fit['rarity_factor_per_plus1degC']:.2f}x rarer per +1$^\\circ$C (R$^2$={fit['r2']:.2f})",
         )
         ds["_fit"] = fit
+    ax.plot([], [], color=COL["reference"], alpha=0.25, linewidth=8,
+            label=f"{int(CI_LEVEL * 100)}% bootstrap CI")
 
     ax.set_xscale("log")
     ax.invert_xaxis()
