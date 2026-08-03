@@ -759,7 +759,7 @@ def plot_empirical_slopes(
         T_line = (logP_line - fit["intercept"]) / fit["slope"]
         ax.plot(
             np.exp(logP_line), T_line, color=c, linewidth=1.4, linestyle="--",
-            label=f"{ds['name']}: {fit['prob_ratio_per_plus1degC']:.2f}x per +1$^\\circ$C (R$^2$={fit['r2']:.2f})",
+            label=f"{ds['name']}: {fit['rarity_factor_per_plus1degC']:.2f}x rarer per +1$^\\circ$C (R$^2$={fit['r2']:.2f})",
         )
         ds["_fit"] = fit
 
