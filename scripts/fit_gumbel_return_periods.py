@@ -434,21 +434,6 @@ def fitted_return_levels(fit: dict, return_periods: np.ndarray) -> np.ndarray:
     return np.where(q < 1, x, np.nan)
 
 
-def empirical_slope_return_levels(emp_fit: dict, rate: float, return_periods: np.ndarray) -> np.ndarray:
-    """
-    Return level x(T) implied by an empirical_tail_slope() fit, i.e. the
-    distribution-free counterpart to fitted_return_levels: inverts
-    ln P(X > x) = slope*x + intercept instead of a Gumbel/GPD/GEV survival
-    function. rate should be the same annual occurrence rate used by the
-    parametric fit being compared against (fit["rate"]), so the two curves
-    share an x-axis. Same T-below-1/rate masking as fitted_return_levels.
-    """
-    q = 1.0 / (rate * return_periods)
-    q = np.clip(q, None, 1 - 1e-12)
-    x = (np.log(q) - emp_fit["intercept"]) / emp_fit["slope"]
-    return np.where(q < 1, x, np.nan)
-
-
 def format_scientific(x: float) -> str:
     """'8.4e+04' -> mathtext '$8.4\\times10^{4}$', for the summary box."""
     if not np.isfinite(x):
@@ -561,7 +546,6 @@ def plot_return_periods(
     reference_value: float = None,
     reference_label: str = None,
     xscale: str = "log",
-    show_empirical_slope: bool = False,
 ):
     """
     Return-period plot for both datasets: empirical (plotting-position)
@@ -585,16 +569,6 @@ def plot_return_periods(
     reference_value (optional): draws a horizontal line (e.g. the 2021 PNW
     heatwave's observed peak) and marks/annotates the return period each
     fitted curve implies for it.
-
-    show_empirical_slope (optional): additionally overlays each curve's
-    empirical_tail_slope() fit (a fully distribution-free linear regression
-    of ln P(X>x|X>threshold) against magnitude, see that function) as a
-    thin dotted line in the same color, labeled "(empirical-slope fit)" --
-    a visual cross-check against the parametric Gumbel/GPD/GEV fit already
-    drawn for that curve. Uses each curve's own fit["rate"] to convert the
-    empirical-slope probability model into the same return-period axis, and
-    fit["threshold"] as the top-percentile cutoff (so it matches the
-    exceedances that curve's parametric fit itself was built from).
     """
     curves = [(fit_era5, era5_values, COL["era5"], COL["era5_ci"], "-", "ERA5")]
     if fit_era5_sensitivity is not None:
@@ -660,21 +634,6 @@ def plot_return_periods(
             linewidth=1.4, linestyle=linestyle,
             label=f"{label} ({dist_label[fit['dist']]} fit)", zorder=4,
         )
-
-    if show_empirical_slope:
-        # Block maxima's "top 5%" would be ~1 point out of 20 -- not a
-        # meaningful regression sample, so this overlay only applies to
-        # POT curves (era5/era5-sensitivity/reforecast), not block maxima.
-        for fit, values, color, _, _, label in curves:
-            if fit["rate_mode"] == "block_maxima":
-                continue
-            emp_fit = empirical_tail_slope(values, THRESHOLD_PERCENTILE)
-            ax.plot(
-                T_fit, empirical_slope_return_levels(emp_fit, fit["rate"], T_fit), color=color,
-                linewidth=1.0, linestyle=(0, (1, 1)), alpha=0.8,
-                label=f"{label} (empirical-slope fit)", zorder=4,
-            )
-
     ax.plot([], [], color=COL["reference"], alpha=0.25, linewidth=8,
             label=f"{int(CI_LEVEL * 100)}% bootstrap CI")
 
@@ -880,15 +839,9 @@ def parse_args():
     )
     p.add_argument(
         "--empirical-slope-plot", action="store_true",
-        help="also produce a standalone distribution-free tail-slope cross-check plot "
+        help="also produce a distribution-free tail-slope cross-check plot "
              "(empirical_tail_slope / plot_empirical_slopes), saved as "
              "{out_base}_empirical_slope.png/.pdf",
-    )
-    p.add_argument(
-        "--empirical-slope-overlay", action="store_true",
-        help="overlay each curve's empirical_tail_slope fit directly onto the main "
-             "return-period plot (plot_return_periods' show_empirical_slope), as a thin "
-             "dotted line alongside its parametric Gumbel/GPD/GEV fit",
     )
     return p.parse_args()
 
@@ -987,7 +940,6 @@ def main():
         fit_era5_block_maxima=fit_era5_bm, era5_block_maxima_values=era5_bm_values,
         block_maxima_label=bm_label,
         reference_value=args.reference_value, reference_label=args.reference_label,
-        show_empirical_slope=args.empirical_slope_overlay,
     )
     fig.savefig(f"{out_base}.pdf")
     fig.savefig(f"{out_base}.png")
