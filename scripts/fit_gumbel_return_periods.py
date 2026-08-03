@@ -780,6 +780,7 @@ def empirical_tail_slope(
     values: np.ndarray,
     threshold_percentile: float = THRESHOLD_PERCENTILE,
     drop_extreme: str = None,
+    anomaly: bool = False,
 ) -> dict:
     """
     Distribution-free cross-check on the POT fit: linear regression of
@@ -787,6 +788,22 @@ def empirical_tail_slope(
     (100 - threshold_percentile)% of values directly (Weibull plotting
     position) -- no Gumbel/GPD assumption. slope is d(ln P)/dT (negative:
     probability falls as magnitude rises).
+
+    anomaly: if True, `values` are centered on their own mean
+    (values - values.mean()) before thresholding, so magnitude/threshold/
+    exceedances/dropped_value all read as "degrees above this dataset's
+    own mean" rather than absolute t2m -- matches the original
+    get_top5()'s `centered = data - np.mean(data)`. This is a pure shift:
+    it changes none of slope, r2, prob_ratio_per_plus1degC, or
+    rarity_factor_per_plus1degC (all derived only from the slope, and a
+    constant offset to every x value doesn't change a regression's
+    slope), and it doesn't change which points land in the top
+    percentile either (percentile selection is shift-invariant). What it
+    changes is purely how the x-axis reads, and -- because each dataset
+    is centered on *its own* mean -- it's what makes datasets with
+    different climatological biases (e.g. different CMIP models, or a
+    biased reforecast) comparable on the same axis in
+    plot_empirical_slopes.
 
     Two ways to read the same +1 degree change, both derived from slope,
     not two different degree offsets -- earlier drafts of this labeled
@@ -821,6 +838,8 @@ def empirical_tail_slope(
       more "correct" in general, they just answer different questions.
     """
     values = np.asarray(values)
+    if anomaly:
+        values = values - values.mean()
     threshold = np.percentile(values, threshold_percentile)
     exceed_full = np.sort(values[values >= threshold])
     m_full = len(exceed_full)
@@ -868,6 +887,7 @@ def bootstrap_empirical_slope_ci(
     log_survival_grid: np.ndarray,
     threshold_percentile: float = THRESHOLD_PERCENTILE,
     drop_extreme: str = None,
+    anomaly: bool = False,
     n_boot: int = N_BOOTSTRAP,
     ci: float = CI_LEVEL,
     seed: int = BOOTSTRAP_SEED,
@@ -880,6 +900,13 @@ def bootstrap_empirical_slope_ci(
     the top-percentile threshold, refits the ln(P) vs. magnitude
     regression, and evaluates it at the given log_survival_grid (the
     same x grid the caller is about to plot the central fit line on).
+
+    anomaly: passed through to empirical_tail_slope on every replicate,
+    so each resample is re-centered on its own resampled mean -- the
+    same case-resampling philosophy already used for re-selecting the
+    threshold per replicate. Since centering is a pure shift, this
+    changes the CI band's location by roughly -values.mean() but not its
+    shape or width.
     """
     values = np.asarray(values)
     n = len(values)
@@ -889,7 +916,9 @@ def bootstrap_empirical_slope_ci(
     for b in range(n_boot):
         sample = rng.choice(values, size=n, replace=True)
         try:
-            fit_b = empirical_tail_slope(sample, threshold_percentile, drop_extreme=drop_extreme)
+            fit_b = empirical_tail_slope(
+                sample, threshold_percentile, drop_extreme=drop_extreme, anomaly=anomaly
+            )
             if fit_b["m"] < 2:
                 continue
             boot_x[b] = (log_survival_grid - fit_b["intercept"]) / fit_b["slope"]
@@ -957,7 +986,8 @@ def collect_empirical_slope_datasets(
 
 
 def plot_empirical_slopes(
-    datasets: list, xlabel: str = "P(X > x | X > threshold)", ylabel: str = r"t2m ($^\circ$C)"
+    datasets: list, xlabel: str = "P(X > x | X > threshold)", ylabel: str = None,
+    anomaly: bool = False,
 ):
     """
     empirical_tail_slope for an arbitrary list of named datasets, plotted
@@ -966,6 +996,16 @@ def plot_empirical_slopes(
     convention), y-axis = magnitude. Each fit line gets a shaded 90%
     bootstrap CI band (bootstrap_empirical_slope_ci), matching the bands
     already shown on the main parametric return-period plot.
+
+    anomaly: plot-wide default for empirical_tail_slope's anomaly (center
+    each dataset on its own mean before thresholding -- see that
+    function's docstring for why this changes nothing about slope/R^2/
+    rarity_factor, only what the axis means and how comparable different
+    datasets' curves are). ylabel defaults to "t2m anomaly" or "t2m"
+    accordingly, unless overridden. Override per-dataset with an
+    "anomaly" key in that dataset's dict if you need to mix conventions
+    (not recommended -- an anomaly-centered curve and an absolute one on
+    the same axes compare different things).
 
     datasets: list of dicts, each with keys:
         name (str), values (array), color (str), marker (str, optional),
@@ -977,7 +1017,9 @@ def plot_empirical_slopes(
             background context behind ERA5/reforecast),
         threshold_percentile (float, optional, defaults to THRESHOLD_PERCENTILE),
         drop_extreme (str, optional -- "max"/"min", leave-one-out check;
-            see empirical_tail_slope's docstring)
+            see empirical_tail_slope's docstring),
+        anomaly (bool, optional -- overrides the plot-wide anomaly setting
+            for just this dataset)
     To add a CMIP model, append another dict -- e.g.
         datasets.append({"name": "CMIP6 model A", **MODEL_COLORS["cmip_model_1"],
                           "values": cmip1_values})
@@ -988,11 +1030,17 @@ def plot_empirical_slopes(
     Mutates each dict in place with a "_fit" key (the empirical_tail_slope
     result) so the caller can build a summary table afterward.
     """
+    if ylabel is None:
+        ylabel = r"t2m anomaly ($^\circ$C)" if anomaly else r"t2m ($^\circ$C)"
+
     fig, ax = plt.subplots(figsize=(7, 5))
     for ds in datasets:
         threshold_percentile = ds.get("threshold_percentile", THRESHOLD_PERCENTILE)
         drop_extreme = ds.get("drop_extreme")
-        fit = empirical_tail_slope(ds["values"], threshold_percentile, drop_extreme=drop_extreme)
+        ds_anomaly = ds.get("anomaly", anomaly)
+        fit = empirical_tail_slope(
+            ds["values"], threshold_percentile, drop_extreme=drop_extreme, anomaly=ds_anomaly
+        )
         c, marker = ds["color"], ds.get("marker", "o")
         ci_color = ds.get("ci", "#cccccc")
         alpha = ds.get("alpha", 1.0)
@@ -1000,7 +1048,8 @@ def plot_empirical_slopes(
 
         logP_line = np.linspace(fit["log_survival"].min(), fit["log_survival"].max(), 100)
         lower, upper = bootstrap_empirical_slope_ci(
-            ds["values"], logP_line, threshold_percentile, drop_extreme=drop_extreme
+            ds["values"], logP_line, threshold_percentile,
+            drop_extreme=drop_extreme, anomaly=ds_anomaly,
         )
         ax.fill_between(
             np.exp(logP_line), lower, upper, color=ci_color, alpha=0.6 * alpha, linewidth=0, zorder=1
@@ -1300,6 +1349,15 @@ def parse_args():
              "{out_base}_empirical_slope.png/.pdf",
     )
     p.add_argument(
+        "--empirical-slope-anomaly", action=argparse.BooleanOptionalAction, default=True,
+        help="center each dataset on its own mean before thresholding on the "
+             "empirical-slope plot, so the axis reads as degrees above that dataset's "
+             "own climatology rather than absolute t2m (default: on). Pure shift -- "
+             "doesn't change slope/R^2/rarity_factor, only what the axis means and "
+             "makes different datasets' climatological biases comparable. "
+             "--no-empirical-slope-anomaly to plot absolute magnitudes instead.",
+    )
+    p.add_argument(
         "--empirical-slope-show", default=None,
         help="comma-separated subset of dataset names to draw on the empirical-slope "
              "plot -- any of 'ERA5', 'ERA5 (excl. max)', 'Reforecast', or a loaded CMIP "
@@ -1476,7 +1534,7 @@ def main():
                 show.add(sens_label)
         datasets = [ds for name, ds in all_datasets.items() if name in show]
 
-        fig_slope, datasets = plot_empirical_slopes(datasets)
+        fig_slope, datasets = plot_empirical_slopes(datasets, anomaly=args.empirical_slope_anomaly)
         fig_slope.savefig(f"{out_base}_empirical_slope.pdf")
         fig_slope.savefig(f"{out_base}_empirical_slope.png")
         print(f"\nEmpirical tail-slope cross-check ({THRESHOLD_PERCENTILE}th percentile threshold):")
