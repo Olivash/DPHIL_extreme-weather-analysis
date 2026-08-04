@@ -35,6 +35,13 @@ CMIP_GLOB = "Network/historical_ssp/*2001_2020.nc"
 CMIP_VAR = "tasmax"
 LEAD_DAY = 12  # must match the reforecast zarr's fixed lead (checked at runtime)
 
+# Restrict to the first N inidates (chronologically) so the season window matches the original
+# refore.csv-based averaged-series reforecast. N_INIDATES=11 -> 06-15..07-24 (confirmed against
+# the CSV). Set to None to use all 25 available inidates instead (06-15..09-11 -- note 3 of those
+# fall outside JJA, in early September) for a broader-season run; see fit_gumbel_gridded.py's
+# docstring discussion for why pooling more dates needs day-of-year de-seasonalizing to be valid.
+N_INIDATES = 11
+
 THRESHOLD_PERCENTILE = 95  # top 5%, same convention as the scalar scripts
 ANOMALY = True  # center each cell on its own time-mean first (matches empirical_tail_slope)
 
@@ -139,15 +146,25 @@ def plot_tail_slope_map(out: xr.Dataset, field: str = "rarity_factor_per_plus1de
 
 # ── Data loading (global grid, no box selection) ────────────────────────────
 
-def compute_target_mmdd(refore_ds: xr.Dataset, lead_day: int) -> set:
-    """Calendar mm-dd of the reforecast's valid dates (inidate + lead), independent of hDate."""
+def compute_target_mmdd(refore_ds: xr.Dataset, lead_day: int, n_inidates: int = None):
+    """
+    Calendar mm-dd of the reforecast's valid dates (inidate + lead), independent of hDate.
+    n_inidates=None uses every inidate in the zarr (25, spanning 06-15..09-11 -- note 3 of
+    those fall outside JJA). n_inidates=11 matches the original refore.csv-based averaged
+    series: the first 11 inidates chronologically (06-15..07-24).
+    Returns (target_mmdd: set, selected_inidates: array of the actual inidate coord values used).
+    """
     lead_days = refore_ds["time"].values / np.timedelta64(1, "D")
     lead_days = np.atleast_1d(lead_days)
     if not np.allclose(lead_days, lead_day):
         raise ValueError(f"reforecast zarr's 'time' (lead) is {lead_days} days, expected {lead_day} -- "
                           f"LEAD_DAY config doesn't match the file")
-    valid_dates = pd.to_datetime(refore_ds["inidate"].values) + pd.Timedelta(days=lead_day)
-    return set(valid_dates.strftime("%m-%d"))
+    inidates = pd.to_datetime(refore_ds["inidate"].values)
+    selected_inidates = np.sort(inidates.values)
+    if n_inidates is not None:
+        selected_inidates = selected_inidates[:n_inidates]
+    valid_dates = pd.to_datetime(selected_inidates) + pd.Timedelta(days=lead_day)
+    return set(valid_dates.strftime("%m-%d")), selected_inidates
 
 
 def _maybe_kelvin_to_celsius(da: xr.DataArray) -> xr.DataArray:
@@ -170,9 +187,14 @@ def load_era5_grid(path: str, target_mmdd: set, var: str = "t2m") -> xr.DataArra
     return da.chunk({"time": -1, "lat": CHUNK_LAT, "lon": CHUNK_LON})
 
 
-def load_reforecast_grid(path: str, var: str = "t2m") -> xr.DataArray:
+def load_reforecast_grid(path: str, inidate_sel=None, var: str = "t2m") -> xr.DataArray:
+    """inidate_sel restricts to a subset of inidate values (e.g. the 11 from compute_target_mmdd)
+    so the reforecast's own sample count/season window matches whatever ERA5/CMIP were filtered
+    to -- otherwise the reforecast would still pool all 25 inidates regardless of target_mmdd."""
     ds = xr.open_zarr(path)
     da = ds[var].rename({"latitude": "lat", "longitude": "lon"})
+    if inidate_sel is not None:
+        da = da.sel(inidate=inidate_sel)
     da = da.stack(sample=("hDate", "inidate", "number"))
     da = _maybe_kelvin_to_celsius(da)
     return da.chunk({"sample": -1, "lat": CHUNK_LAT, "lon": CHUNK_LON})
@@ -201,7 +223,7 @@ def cmip_model_name(path: str) -> str:
 
 def main():
     refore_ds = xr.open_zarr(REFORECAST_PATH)
-    target_mmdd = compute_target_mmdd(refore_ds, LEAD_DAY)
+    target_mmdd, selected_inidates = compute_target_mmdd(refore_ds, LEAD_DAY, n_inidates=N_INIDATES)
     print(f"target_mmdd ({len(target_mmdd)} dates): {sorted(target_mmdd)}")
 
     # ERA5
@@ -214,7 +236,7 @@ def main():
     fig.savefig(f"{OUT_PREFIX}_era5.png")
 
     # Reforecast
-    refore_da = load_reforecast_grid(REFORECAST_PATH)
+    refore_da = load_reforecast_grid(REFORECAST_PATH, inidate_sel=selected_inidates)
     print(f"Reforecast grid: {dict(refore_da.sizes)}")
     refore_out = empirical_tail_slope_grid(refore_da, "sample")
     refore_out.to_netcdf(f"{OUT_PREFIX}_reforecast.nc")
