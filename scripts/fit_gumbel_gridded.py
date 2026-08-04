@@ -92,6 +92,11 @@ def empirical_tail_slope_grid(data: xr.DataArray, sample_dim: str,
         x_mean = top_k.mean(axis=-1, keepdims=True)
         xc = top_k - x_mean
         denom = (xc ** 2).sum(axis=-1)
+        # Degenerate cells (near-constant top-K values, e.g. some polar/masked points) give
+        # denom ~ 0, which blows slope/rarity_factor up to nonsense (1e6+) instead of erroring --
+        # that silently wrecks both plot color scales and box-mean averages. Mark them NaN
+        # explicitly instead so downstream skipna/percentile handling can ignore them cleanly.
+        degenerate = denom < 1e-8 * max(float(np.nanmax(np.abs(xc))), 1.0) ** 2
         with np.errstate(invalid="ignore", divide="ignore"):
             slope = (xc * yc).sum(axis=-1) / denom
         intercept = y_mean - slope * x_mean.squeeze(-1)
@@ -100,7 +105,12 @@ def empirical_tail_slope_grid(data: xr.DataArray, sample_dim: str,
         with np.errstate(invalid="ignore", divide="ignore"):
             r2 = 1 - ss_res / ss_tot
         threshold = top_k[..., 0]
-        rarity_factor = np.exp(-slope)
+        with np.errstate(over="ignore"):
+            rarity_factor = np.exp(-slope)
+        slope = np.where(degenerate, np.nan, slope)
+        intercept = np.where(degenerate, np.nan, intercept)
+        r2 = np.where(degenerate, np.nan, r2)
+        rarity_factor = np.where(degenerate, np.nan, rarity_factor)
         return threshold, slope, intercept, r2, rarity_factor
 
     threshold, slope, intercept, r2, rarity_factor = xr.apply_ufunc(
@@ -114,7 +124,7 @@ def empirical_tail_slope_grid(data: xr.DataArray, sample_dim: str,
         "threshold": threshold, "slope": slope, "intercept": intercept,
         "r2": r2, "rarity_factor_per_plus1degC": rarity_factor,
     })
-    out.attrs.update(m=K, threshold_percentile=threshold_percentile, anomaly=anomaly)
+    out.attrs.update(m=K, threshold_percentile=threshold_percentile, anomaly=int(anomaly))
     return out
 
 
@@ -122,12 +132,20 @@ def box_mean(out: xr.Dataset, lat_bounds=CMIP_LAT_BOUNDS, lon_bounds=CMIP_LON_BO
     """PNW-box area-weighted mean, as a cheap cross-check against the scalar scripts' numbers."""
     lat_lo, lat_hi = lat_bounds
     lon_lo, lon_hi = lon_bounds
+    # lon_bounds are given in -180..180 (matching CMIP/reforecast); ERA5's own grid is 0..360,
+    # so -123..-119 selects nothing there unless converted first -- that silently empty-selects
+    # and .mean() over zero cells returns NaN with no error, which is what was happening.
+    if float(out["lon"].min()) >= 0:
+        lon_lo, lon_hi = lon_lo % 360, lon_hi % 360
     lat = out["lat"]
-    box = out.sel(lat=slice(min(lat_lo, lat_hi), max(lat_lo, lat_hi)), lon=slice(lon_lo, lon_hi))
+    box = out.sel(lat=slice(min(lat_lo, lat_hi), max(lat_lo, lat_hi)), lon=slice(min(lon_lo, lon_hi), max(lon_lo, lon_hi)))
     if box.sizes.get("lat", 0) == 0:
-        box = out.sel(lat=slice(max(lat_lo, lat_hi), min(lat_lo, lat_hi)), lon=slice(lon_lo, lon_hi))
+        box = out.sel(lat=slice(max(lat_lo, lat_hi), min(lat_lo, lat_hi)), lon=slice(min(lon_lo, lon_hi), max(lon_lo, lon_hi)))
+    if box.sizes.get("lat", 0) == 0 or box.sizes.get("lon", 0) == 0:
+        raise ValueError(f"PNW box selection is empty (lat={lat_bounds}, lon={lon_bounds} -> "
+                          f"resolved to lon={lon_lo, lon_hi}) -- check the grid's lat/lon convention")
     weights = np.cos(np.deg2rad(box["lat"]))
-    return {k: float(box[k].weighted(weights).mean().compute()) for k in
+    return {k: float(box[k].weighted(weights).mean(skipna=True).compute()) for k in
             ["slope", "r2", "rarity_factor_per_plus1degC"]}
 
 
@@ -135,6 +153,13 @@ def plot_tail_slope_map(out: xr.Dataset, field: str = "rarity_factor_per_plus1de
                          cmap: str = "viridis", title: str = None, vmin=None, vmax=None):
     fig, ax = plt.subplots(figsize=(9, 4.5))
     da = out[field].compute()
+    if vmin is None and vmax is None:
+        # A handful of degenerate cells can otherwise stretch the color scale so far that
+        # every normal cell reads as the same flat color -- clip to the 2nd/98th percentile
+        # of the FINITE values instead. Pass vmin/vmax explicitly to override.
+        finite = da.values[np.isfinite(da.values)]
+        if finite.size:
+            vmin, vmax = np.nanpercentile(finite, [2, 98])
     mesh = ax.pcolormesh(out["lon"], out["lat"], da, cmap=cmap, shading="auto", vmin=vmin, vmax=vmax)
     fig.colorbar(mesh, ax=ax, label=field, shrink=0.85)
     ax.set_xlabel("lon")
@@ -230,6 +255,8 @@ def main():
     era5_da = load_era5_grid(ERA5_PATH, target_mmdd)
     print(f"ERA5 grid: {dict(era5_da.sizes)}")
     era5_out = empirical_tail_slope_grid(era5_da, "time")
+    era5_out = era5_out.load()  # materialize once -- to_netcdf/box_mean/plot below would each
+    # otherwise re-run the full lazy dask graph (re-read + refit the whole grid) from scratch
     era5_out.to_netcdf(f"{OUT_PREFIX}_era5.nc")
     print("ERA5 PNW-box cross-check:", box_mean(era5_out))
     fig = plot_tail_slope_map(era5_out, title="ERA5: rarity factor per +1C (empirical tail slope)")
@@ -239,6 +266,7 @@ def main():
     refore_da = load_reforecast_grid(REFORECAST_PATH, inidate_sel=selected_inidates)
     print(f"Reforecast grid: {dict(refore_da.sizes)}")
     refore_out = empirical_tail_slope_grid(refore_da, "sample")
+    refore_out = refore_out.load()  # see ERA5 comment above -- avoid 3x recompute of a 20GB read
     refore_out.to_netcdf(f"{OUT_PREFIX}_reforecast.nc")
     print("Reforecast PNW-box cross-check:", box_mean(refore_out))
     fig = plot_tail_slope_map(refore_out, title=f"Reforecast day {LEAD_DAY}: rarity factor per +1C")
@@ -252,6 +280,7 @@ def main():
         cmip_da = load_cmip_grid(path, target_mmdd)
         print(f"  {name} grid: {dict(cmip_da.sizes)}")
         cmip_out = empirical_tail_slope_grid(cmip_da, "time")
+        cmip_out = cmip_out.load()  # see ERA5 comment above
         cmip_out.to_netcdf(f"{OUT_PREFIX}_cmip_{name}.nc")
         print(f"  {name} PNW-box cross-check:", box_mean(cmip_out))
         fig = plot_tail_slope_map(cmip_out, title=f"{name}: rarity factor per +1C")
