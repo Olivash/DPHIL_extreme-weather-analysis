@@ -41,6 +41,7 @@ except ImportError:
 ERA5_PATH = "/network/group/aopp/predict/AWH020_AYIM_EXTREME/ERA5/era5_t2m/nick_testing/all_years.zarr"
 REFORECAST_PATH = "/network/group/aopp/predict/MRA001_AYIM_REFORCST/full_refore.zarr"
 CMIP_GLOB = "Network/historical_ssp/*2001_2020.nc"
+AMIP_GLOB = "/network/group/aopp/predict/MRA001_AYIM_REFORCST/dtree_zarr_output_now/*.nc"
 CMIP_VAR = "tasmax"
 LEAD_DAY = 12  # must match the reforecast zarr's fixed lead (checked at runtime)
 
@@ -271,14 +272,24 @@ def plot_tail_slope_map(out: xr.Dataset, field: str = "rarity_factor_per_plus1de
 
 # ── Regional comparison: area vs model ──────────────────────────────────────
 
-def build_model_file_map(cmip_glob: str = CMIP_GLOB, out_prefix: str = OUT_PREFIX) -> dict:
-    """{model_name: saved .nc path}, for every dataset main() already wrote to disk. Derives the
-    CMIP model list from CMIP_GLOB (matching cmip_model_name()) rather than a hardcoded list, so
-    it can't drift out of sync with what main() actually saved."""
+def build_model_file_map(cmip_glob: str = CMIP_GLOB, amip_glob: str = AMIP_GLOB,
+                          out_prefix: str = OUT_PREFIX, include_amip: bool = True) -> dict:
+    """
+    {model_name: saved .nc path}, for every dataset main() already wrote to disk. Derives the
+    model lists from CMIP_GLOB/AMIP_GLOB (matching cmip_model_name()) rather than hardcoded
+    lists, so it can't drift out of sync with what main() actually saved. CMIP and AMIP entries
+    are labeled distinctly ("(hist-ssp)" / "(AMIP)") since some model names appear in both sets
+    but represent different experiments -- exactly the "these might give different results"
+    comparison this is for. Set include_amip=False to only get the CMIP historical_ssp set.
+    """
     files = {"ERA5": f"{out_prefix}_era5.nc", "Reforecast": f"{out_prefix}_reforecast.nc"}
     for path in sorted(glob.glob(cmip_glob)):
         name = cmip_model_name(path)
-        files[name] = f"{out_prefix}_cmip_{name}.nc"
+        files[f"{name} (hist-ssp)"] = f"{out_prefix}_cmip_{name}.nc"
+    if include_amip:
+        for path in sorted(glob.glob(amip_glob)):
+            name = cmip_model_name(path)
+            files[f"{name} (AMIP)"] = f"{out_prefix}_amip_{name}.nc"
     return files
 
 
@@ -454,21 +465,24 @@ def load_reforecast_grid(path: str, inidate_sel=None, var: str = "t2m") -> xr.Da
 
 def load_cmip_grid(path: str, target_mmdd: set, var: str = CMIP_VAR) -> xr.DataArray:
     """
-    Loads one CMIP model, filtered to target_mmdd. Not every file has exactly one ensemble
-    member -- when member > 1, pool them into the sample dimension as additional independent
-    draws (same UNSEEN-style treatment already used for the reforecast's ensemble) instead of
-    discarding all but one. Always returns a "sample" dim (renamed from "time" when there's
-    only one member) so callers don't need to know which case applied.
+    Loads one CMIP/AMIP model, filtered to target_mmdd. Handles both "member" (the historical_ssp
+    files) and "member_id" (the AMIP dtree_zarr_output_now files) as the ensemble-member
+    dimension name -- otherwise identical structure, so one loader covers both. Not every file
+    has exactly one ensemble member -- when member > 1, pool them into the sample dimension as
+    additional independent draws (same UNSEEN-style treatment already used for the reforecast's
+    ensemble) instead of discarding all but one. Always returns a "sample" dim (renamed from
+    "time" when there's only one member) so callers don't need to know which case applied.
     """
     ds = xr.open_dataset(path, chunks={})
     da = ds[var]
     mask = da["time"].dt.strftime("%m-%d").isin(sorted(target_mmdd))
     da = da.isel(time=mask.values)
-    if "member" in da.dims and da.sizes["member"] > 1:
-        da = da.stack(sample=("time", "member"))
+    member_dim = next((d for d in ("member", "member_id") if d in da.dims), None)
+    if member_dim is not None and da.sizes[member_dim] > 1:
+        da = da.stack(sample=("time", member_dim))
     else:
-        if "member" in da.dims:
-            da = da.squeeze("member", drop=True)
+        if member_dim is not None:
+            da = da.squeeze(member_dim, drop=True)
         da = da.rename({"time": "sample"})
     da = _maybe_kelvin_to_celsius(da)
     return da.chunk({"sample": -1, "lat": CHUNK_LAT, "lon": CHUNK_LON})
@@ -523,6 +537,23 @@ def main():
         print(f"  {name} PNW-box cross-check:", box_mean(cmip_out))
         fig = plot_tail_slope_map(cmip_out, title=f"{name}: rarity factor per +1C")
         fig.savefig(f"{OUT_PREFIX}_cmip_{name}.png")
+
+    # AMIP (dtree_zarr_output_now) -- separate from the CMIP historical_ssp set above. Same
+    # loader (load_cmip_grid handles both "member" and "member_id" dim names) and same
+    # target_mmdd, but a different output prefix so results don't collide even for model names
+    # that appear in both sets -- the point is to compare the two, not merge them.
+    amip_files = sorted(glob.glob(AMIP_GLOB))
+    print(f"AMIP files: {len(amip_files)}")
+    for path in amip_files:
+        name = cmip_model_name(path)
+        amip_da = load_cmip_grid(path, target_mmdd)
+        print(f"  {name} (AMIP) grid: {dict(amip_da.sizes)}")
+        amip_out = empirical_tail_slope_grid(amip_da, "sample")
+        amip_out = amip_out.load()  # see ERA5 comment above
+        amip_out.to_netcdf(f"{OUT_PREFIX}_amip_{name}.nc")
+        print(f"  {name} (AMIP) PNW-box cross-check:", box_mean(amip_out))
+        fig = plot_tail_slope_map(amip_out, title=f"{name} (AMIP): rarity factor per +1C")
+        fig.savefig(f"{OUT_PREFIX}_amip_{name}.png")
 
     # Regional comparison: area vs model (reopens the .nc files just saved, no recompute)
     table = region_model_table()
