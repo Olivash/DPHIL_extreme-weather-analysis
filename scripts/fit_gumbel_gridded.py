@@ -16,8 +16,9 @@ against the tracked scalar empirical_tail_slope() on tiled real ERA5 data
 (slope/R^2/rarity_factor matched to 4+ decimal places) and against a
 synthetic spatial-pattern grid.
 
-No cartopy in this environment -- maps render as plain lat/lon pcolormesh,
-no coastlines/projection. Swap in cartopy's GeoAxes / add_feature if wanted.
+Uses cartopy (Robinson projection, coastlines/borders, gridlines) when available, matching the
+plotting style used elsewhere in this project -- falls back to plain lat/lon pcolormesh (no
+projection/coastlines) if cartopy isn't installed, so this still runs somewhere without it.
 """
 
 import glob
@@ -27,6 +28,14 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
+from matplotlib.colors import BoundaryNorm
+
+try:
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    HAS_CARTOPY = True
+except ImportError:
+    HAS_CARTOPY = False
 
 # ── Config ───────────────────────────────────────────────────────────────────
 ERA5_PATH = "/network/group/aopp/predict/AWH020_AYIM_EXTREME/ERA5/era5_t2m/nick_testing/all_years.zarr"
@@ -54,6 +63,19 @@ CMIP_LAT_BOUNDS = (45, 52)
 CMIP_LON_BOUNDS = (-123, -119)
 
 OUT_PREFIX = "gridded"
+
+# Regions of interest for the area-vs-model comparison: name -> (lat_bounds, lon_bounds), both
+# in -180..180 lon (box_mean converts to 0..360 automatically for grids that need it, e.g. ERA5).
+# Deliberately climate-CONTRASTING, not just other heatwave-history regions -- the point is to
+# stress-test whether the reforecast and the empirical tail-slope method are robust across
+# fundamentally different thermal/variance regimes, not just reproduce PNW-like results elsewhere.
+# All bounds are in (min, max) or (max, min) order -- box_mean handles either. Adjust freely.
+REGIONS = {
+    "PNW": ((45, 52), (-123, -119)),        # temperate maritime -- the original 2021 case, kept as anchor
+    "Sahara": ((20, 28), (0, 15)),           # hyper-arid desert -- extreme heat, very different variance structure
+    "Amazon Basin": ((-8, 3), (-70, -55)),   # tropical -- minimal seasonal cycle, different tail behavior
+    "Siberia": ((60, 68), (90, 120)),        # subarctic/continental -- cold-dominated, heat is not the norm here
+}
 
 plt.rcParams.update({
     "font.family": "serif", "font.serif": ["Times New Roman", "DejaVu Serif"], "font.size": 9,
@@ -128,45 +150,250 @@ def empirical_tail_slope_grid(data: xr.DataArray, sample_dim: str,
     return out
 
 
-def box_mean(out: xr.Dataset, lat_bounds=CMIP_LAT_BOUNDS, lon_bounds=CMIP_LON_BOUNDS) -> dict:
-    """PNW-box area-weighted mean, as a cheap cross-check against the scalar scripts' numbers."""
+def select_box(out: xr.Dataset, lat_bounds=CMIP_LAT_BOUNDS, lon_bounds=CMIP_LON_BOUNDS) -> xr.Dataset:
+    """
+    Crop a gridded Dataset to a lat/lon box, handling both -180..180 and 0..360 longitude
+    conventions (bounds are given in -180..180; converted automatically for a 0..360 grid like
+    ERA5's -- otherwise -123..-119 silently selects zero cells there) and either latitude
+    ordering (ascending like CMIP, or descending like ERA5/reforecast). Raises instead of
+    silently returning an empty selection.
+    """
     lat_lo, lat_hi = lat_bounds
     lon_lo, lon_hi = lon_bounds
-    # lon_bounds are given in -180..180 (matching CMIP/reforecast); ERA5's own grid is 0..360,
-    # so -123..-119 selects nothing there unless converted first -- that silently empty-selects
-    # and .mean() over zero cells returns NaN with no error, which is what was happening.
     if float(out["lon"].min()) >= 0:
         lon_lo, lon_hi = lon_lo % 360, lon_hi % 360
-    lat = out["lat"]
     box = out.sel(lat=slice(min(lat_lo, lat_hi), max(lat_lo, lat_hi)), lon=slice(min(lon_lo, lon_hi), max(lon_lo, lon_hi)))
     if box.sizes.get("lat", 0) == 0:
         box = out.sel(lat=slice(max(lat_lo, lat_hi), min(lat_lo, lat_hi)), lon=slice(min(lon_lo, lon_hi), max(lon_lo, lon_hi)))
     if box.sizes.get("lat", 0) == 0 or box.sizes.get("lon", 0) == 0:
-        raise ValueError(f"PNW box selection is empty (lat={lat_bounds}, lon={lon_bounds} -> "
+        raise ValueError(f"box selection is empty (lat={lat_bounds}, lon={lon_bounds} -> "
                           f"resolved to lon={lon_lo, lon_hi}) -- check the grid's lat/lon convention")
+    return box
+
+
+def box_mean(out: xr.Dataset, lat_bounds=CMIP_LAT_BOUNDS, lon_bounds=CMIP_LON_BOUNDS) -> dict:
+    """Area-weighted mean over a lat/lon box, as a cheap cross-check against the scalar scripts' numbers."""
+    box = select_box(out, lat_bounds, lon_bounds)
     weights = np.cos(np.deg2rad(box["lat"]))
     return {k: float(box[k].weighted(weights).mean(skipna=True).compute()) for k in
             ["slope", "r2", "rarity_factor_per_plus1degC"]}
 
 
-def plot_tail_slope_map(out: xr.Dataset, field: str = "rarity_factor_per_plus1degC",
-                         cmap: str = "viridis", title: str = None, vmin=None, vmax=None):
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-    da = out[field].compute()
-    if vmin is None and vmax is None:
-        # A handful of degenerate cells can otherwise stretch the color scale so far that
-        # every normal cell reads as the same flat color -- clip to the 2nd/98th percentile
-        # of the FINITE values instead. Pass vmin/vmax explicitly to override.
-        finite = da.values[np.isfinite(da.values)]
+def to_180_lon(da: xr.DataArray) -> xr.DataArray:
+    """
+    Plotting-only longitude normalization to -180..180. ERA5 is natively 0..360; CMIP and the
+    reforecast are natively -180..180 -- left as-is, this makes ERA5 maps read on a 0-360 axis
+    while the others read -180..180, which is confusing to compare side by side even though the
+    underlying data/analysis (select_box, box_mean, mask_ocean) are already convention-agnostic
+    and don't need this. No-op if already -180..180. Re-sorts after the wrap so lon stays
+    monotonic -- required for correct pcolormesh rendering, otherwise there's a jump at 180.
+    """
+    if float(da["lon"].min()) < 0:
+        return da
+    new_lon = ((da["lon"] + 180) % 360) - 180
+    return da.assign_coords(lon=new_lon).sortby("lon")
+
+
+def mask_ocean(da: xr.DataArray) -> xr.DataArray:
+    """
+    Mask out ocean cells using regionmask's Natural Earth 110m land polygon (pip install
+    regionmask). .mask() handles both -180..180 and 0..360 longitude conventions natively --
+    no manual conversion needed, unlike select_box's PNW-box logic.
+    """
+    try:
+        import regionmask
+    except ImportError as e:
+        raise ImportError("mask_ocean() requires the 'regionmask' package (pip install "
+                           "regionmask) -- or pass mask_ocean_cells=False to skip land masking.") from e
+    land = regionmask.defined_regions.natural_earth_v5_0_0.land_110
+    land_mask = land.mask(da["lon"], da["lat"])
+    return da.where(np.isfinite(land_mask))
+
+
+def _discrete_log_levels(data, n_levels: int = 10, vmin=None, vmax=None) -> np.ndarray:
+    """n_levels+1 log-spaced bin edges spanning the 2nd/98th percentile of data's finite, positive
+    values (rarity_factor is always > 0; a log scale can't represent <= 0 values anyway). `data`
+    can be a DataArray or a plain array -- just needs to support np.asarray()."""
+    values = np.asarray(data)
+    finite = values[np.isfinite(values) & (values > 0)]
+    if vmin is None or vmax is None:
         if finite.size:
-            vmin, vmax = np.nanpercentile(finite, [2, 98])
-    mesh = ax.pcolormesh(out["lon"], out["lat"], da, cmap=cmap, shading="auto", vmin=vmin, vmax=vmax)
-    fig.colorbar(mesh, ax=ax, label=field, shrink=0.85)
-    ax.set_xlabel("lon")
-    ax.set_ylabel("lat")
+            pmin, pmax = np.nanpercentile(finite, [2, 98])
+            vmin = pmin if vmin is None else vmin
+            vmax = pmax if vmax is None else vmax
+        else:
+            vmin, vmax = 1.0, 2.0
+    return np.geomspace(max(vmin, 1e-6), max(vmax, vmin * 1.01), n_levels + 1)
+
+
+def plot_tail_slope_map(out: xr.Dataset, field: str = "rarity_factor_per_plus1degC",
+                         cmap: str = "viridis", title: str = None, vmin=None, vmax=None,
+                         n_levels: int = 10, mask_ocean_cells: bool = True):
+    da = out[field].compute()
+    if mask_ocean_cells:
+        da = mask_ocean(da)
+    da = to_180_lon(da)
+    levels = _discrete_log_levels(da, n_levels=n_levels, vmin=vmin, vmax=vmax)
+    cmap_obj = plt.get_cmap(cmap, n_levels + 2)  # +2 colors for extend="both" (below-min, above-max bins)
+    norm = BoundaryNorm(levels, ncolors=cmap_obj.N, extend="both")
+    tick_labels = [f"{x:.2g}" for x in levels]
+
+    if HAS_CARTOPY:
+        proj = ccrs.Robinson(central_longitude=0)
+        fig, ax = plt.subplots(figsize=(10, 5), subplot_kw={"projection": proj})
+        mesh = da.plot.pcolormesh(ax=ax, transform=ccrs.PlateCarree(), norm=norm, cmap=cmap_obj,
+                                   add_colorbar=False, shading="auto", rasterized=True)
+        ax.add_feature(cfeature.LAND, facecolor="none")
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.3, alpha=0.4)
+        gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.4)
+        gl.top_labels = False
+        gl.right_labels = False
+        gl.xlabel_style = {"size": 9}
+        gl.ylabel_style = {"size": 9}
+        cax = fig.add_axes([0.13, 0.02, 0.74, 0.045])
+        cbar = fig.colorbar(mesh, cax=cax, orientation="horizontal", extend="both")
+        cbar.set_ticks(levels)
+        cbar.ax.minorticks_off()
+        cbar.set_ticklabels(tick_labels)
+        cbar.set_label(field)
+    else:
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        mesh = ax.pcolormesh(da["lon"], da["lat"], da, cmap=cmap_obj, norm=norm, shading="auto")
+        fig.colorbar(mesh, ax=ax, label=field, shrink=0.85, ticks=levels,
+                     format=lambda x, _: f"{x:.2g}")
+        ax.set_xlabel("lon")
+        ax.set_ylabel("lat")
+
     ax.set_title(title or field)
+    return fig
+
+
+# ── Regional comparison: area vs model ──────────────────────────────────────
+
+def build_model_file_map(cmip_glob: str = CMIP_GLOB, out_prefix: str = OUT_PREFIX) -> dict:
+    """{model_name: saved .nc path}, for every dataset main() already wrote to disk. Derives the
+    CMIP model list from CMIP_GLOB (matching cmip_model_name()) rather than a hardcoded list, so
+    it can't drift out of sync with what main() actually saved."""
+    files = {"ERA5": f"{out_prefix}_era5.nc", "Reforecast": f"{out_prefix}_reforecast.nc"}
+    for path in sorted(glob.glob(cmip_glob)):
+        name = cmip_model_name(path)
+        files[name] = f"{out_prefix}_cmip_{name}.nc"
+    return files
+
+
+def region_model_table(regions: dict = REGIONS, model_files: dict = None,
+                        field: str = "rarity_factor_per_plus1degC") -> pd.DataFrame:
+    """Region x model table of box_mean(field), re-opening each already-saved .nc (no recompute)."""
+    if model_files is None:
+        model_files = build_model_file_map()
+    rows = {}
+    for region_name, (lat_bounds, lon_bounds) in regions.items():
+        row = {}
+        for model_name, path in model_files.items():
+            ds = xr.open_dataset(path)
+            row[model_name] = box_mean(ds, lat_bounds=lat_bounds, lon_bounds=lon_bounds)[field]
+        rows[region_name] = row
+    return pd.DataFrame(rows).T  # rows=regions, columns=models
+
+
+def plot_region_model_heatmap(table: pd.DataFrame, field_label: str = "rarity factor per +1C",
+                               cmap: str = "viridis", annotate: bool = True):
+    """Single heatmap: regions (rows) x models (columns), color = table value."""
+    data = table.values.astype(float)
+    fig, ax = plt.subplots(figsize=(0.9 * len(table.columns) + 2.5, 0.6 * len(table.index) + 2))
+    mesh = ax.pcolormesh(data, cmap=cmap, shading="flat", edgecolors="white", linewidth=1)
+    ax.set_xticks(np.arange(len(table.columns)) + 0.5)
+    ax.set_xticklabels(table.columns, rotation=45, ha="right")
+    ax.set_yticks(np.arange(len(table.index)) + 0.5)
+    ax.set_yticklabels(table.index)
+    ax.invert_yaxis()
+    fig.colorbar(mesh, ax=ax, label=field_label, shrink=0.85)
+    if annotate:
+        finite = data[np.isfinite(data)]
+        mid = float(np.nanmean(finite)) if finite.size else 0.0
+        for i in range(data.shape[0]):
+            for j in range(data.shape[1]):
+                val = data[i, j]
+                if np.isfinite(val):
+                    ax.text(j + 0.5, i + 0.5, f"{val:.2f}", ha="center", va="center", fontsize=8,
+                             color="white" if val > mid else "black")
+                else:
+                    ax.text(j + 0.5, i + 0.5, "NaN", ha="center", va="center", fontsize=8, color="0.5")
+    ax.set_title(f"{field_label}: region x model")
     fig.tight_layout()
     return fig
+
+
+def plot_region_maps(region_name: str, lat_bounds, lon_bounds, model_files: dict = None,
+                      field: str = "rarity_factor_per_plus1degC", cmap: str = "viridis", ncols: int = 4,
+                      n_levels: int = 10, mask_ocean_cells: bool = True):
+    """
+    Actual spatial maps (not an averaged number) for one region: one subplot per model, each a
+    pcolormesh crop to that region's lat/lon box. All subplots share one set of discrete,
+    log-spaced color levels (2nd/98th percentile across every model's crop, finite land values
+    only) so the models are visually comparable to each other, not each auto-scaled to its own range.
+    """
+    if model_files is None:
+        model_files = build_model_file_map()
+    crops = {}
+    for model_name, path in model_files.items():
+        ds = xr.open_dataset(path)
+        da = select_box(ds, lat_bounds, lon_bounds)[field].compute()
+        if mask_ocean_cells:
+            da = mask_ocean(da)
+        crops[model_name] = to_180_lon(da)
+
+    # Pool raw values (not xr.concat) -- models are on different native grids (e.g. ERA5 0.25deg
+    # vs CMIP 1deg), so concat would outer-join mismatched lat/lon coords and pad with NaN instead
+    # of just pooling the numbers.
+    pooled_values = np.concatenate([da.values.ravel() for da in crops.values()])
+    levels = _discrete_log_levels(pooled_values, n_levels=n_levels)
+
+    n = len(crops)
+    ncols_eff = min(ncols, n)
+    nrows = int(np.ceil(n / ncols_eff))
+    cmap_obj = plt.get_cmap(cmap, n_levels + 2)
+    norm = BoundaryNorm(levels, ncolors=cmap_obj.N, extend="both")
+
+    subplot_kw = {"projection": ccrs.PlateCarree()} if HAS_CARTOPY else {}
+    fig, axes = plt.subplots(nrows, ncols_eff, figsize=(3.2 * ncols_eff, 2.8 * nrows),
+                              squeeze=False, subplot_kw=subplot_kw)
+    mesh = None
+    for ax, (model_name, da) in zip(axes.flat, crops.items()):
+        if HAS_CARTOPY:
+            mesh = da.plot.pcolormesh(ax=ax, transform=ccrs.PlateCarree(), norm=norm, cmap=cmap_obj,
+                                       add_colorbar=False, shading="auto")
+            ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
+            ax.add_feature(cfeature.BORDERS, linewidth=0.3, alpha=0.4)
+            ax.set_title("")
+        else:
+            mesh = ax.pcolormesh(da["lon"], da["lat"], da, cmap=cmap_obj, norm=norm, shading="auto")
+            ax.set_xlabel("lon", fontsize=8)
+            ax.set_ylabel("lat", fontsize=8)
+        ax.set_title(model_name, fontsize=9)
+        ax.tick_params(labelsize=7)
+    for ax in axes.flat[n:]:
+        ax.axis("off")
+    if mesh is not None:
+        cbar = fig.colorbar(mesh, ax=axes, label=field, shrink=0.8, ticks=levels)
+        cbar.set_ticklabels([f"{x:.2g}" for x in levels])
+    fig.suptitle(f"{region_name}: {field}", y=1.02)
+    return fig
+
+
+def plot_all_region_maps(regions: dict = REGIONS, model_files: dict = None,
+                          field: str = "rarity_factor_per_plus1degC", out_prefix: str = OUT_PREFIX) -> dict:
+    """One map-grid figure per region, saved as {out_prefix}_mapgrid_{region}.png. Returns {region: fig}."""
+    if model_files is None:
+        model_files = build_model_file_map()
+    figs = {}
+    for region_name, (lat_bounds, lon_bounds) in regions.items():
+        fig = plot_region_maps(region_name, lat_bounds, lon_bounds, model_files, field=field)
+        safe_name = region_name.replace(" ", "_").replace("(", "").replace(")", "").replace(".", "")
+        fig.savefig(f"{out_prefix}_mapgrid_{safe_name}.png")
+        figs[region_name] = fig
+    return figs
 
 
 # ── Data loading (global grid, no box selection) ────────────────────────────
@@ -226,14 +453,25 @@ def load_reforecast_grid(path: str, inidate_sel=None, var: str = "t2m") -> xr.Da
 
 
 def load_cmip_grid(path: str, target_mmdd: set, var: str = CMIP_VAR) -> xr.DataArray:
+    """
+    Loads one CMIP model, filtered to target_mmdd. Not every file has exactly one ensemble
+    member -- when member > 1, pool them into the sample dimension as additional independent
+    draws (same UNSEEN-style treatment already used for the reforecast's ensemble) instead of
+    discarding all but one. Always returns a "sample" dim (renamed from "time" when there's
+    only one member) so callers don't need to know which case applied.
+    """
     ds = xr.open_dataset(path, chunks={})
     da = ds[var]
-    if "member" in da.dims:
-        da = da.squeeze("member", drop=True)
     mask = da["time"].dt.strftime("%m-%d").isin(sorted(target_mmdd))
     da = da.isel(time=mask.values)
+    if "member" in da.dims and da.sizes["member"] > 1:
+        da = da.stack(sample=("time", "member"))
+    else:
+        if "member" in da.dims:
+            da = da.squeeze("member", drop=True)
+        da = da.rename({"time": "sample"})
     da = _maybe_kelvin_to_celsius(da)
-    return da.chunk({"time": -1, "lat": CHUNK_LAT, "lon": CHUNK_LON})
+    return da.chunk({"sample": -1, "lat": CHUNK_LAT, "lon": CHUNK_LON})
 
 
 def cmip_model_name(path: str) -> str:
@@ -279,12 +517,23 @@ def main():
         name = cmip_model_name(path)
         cmip_da = load_cmip_grid(path, target_mmdd)
         print(f"  {name} grid: {dict(cmip_da.sizes)}")
-        cmip_out = empirical_tail_slope_grid(cmip_da, "time")
+        cmip_out = empirical_tail_slope_grid(cmip_da, "sample")
         cmip_out = cmip_out.load()  # see ERA5 comment above
         cmip_out.to_netcdf(f"{OUT_PREFIX}_cmip_{name}.nc")
         print(f"  {name} PNW-box cross-check:", box_mean(cmip_out))
         fig = plot_tail_slope_map(cmip_out, title=f"{name}: rarity factor per +1C")
         fig.savefig(f"{OUT_PREFIX}_cmip_{name}.png")
+
+    # Regional comparison: area vs model (reopens the .nc files just saved, no recompute)
+    table = region_model_table()
+    print(table)
+    fig = plot_region_model_heatmap(table)
+    fig.savefig(f"{OUT_PREFIX}_region_vs_model.png")
+    table.to_csv(f"{OUT_PREFIX}_region_vs_model.csv")
+
+    # Actual spatial maps per region (not just the averaged table above) -- one figure per
+    # region, one subplot per model, so spatial patterns are visible, not just a single number
+    plot_all_region_maps()
 
     print("Done.")
 
