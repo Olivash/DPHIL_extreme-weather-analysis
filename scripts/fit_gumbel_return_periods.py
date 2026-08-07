@@ -320,6 +320,26 @@ def apply_bias(reforecast_df: pd.DataFrame, bias_df: pd.DataFrame, out_col: str 
     return df
 
 
+def _fit_gumbel_lmoments(x: np.ndarray) -> tuple:
+    """
+    L-moments (probability-weighted moments) fit for the Gumbel distribution, used instead of
+    MLE -- on a small POT/block-maxima sample, MLE's greater sensitivity to the exact shape of
+    the upper tail can pull the fitted return-level curve into implausibly steep extrapolation.
+    Standard PWM-based Gumbel estimator (Hosking & Wallis 1997): scale = l2/ln(2),
+    loc = l1 - euler_gamma*scale. Verified to match the `lmoments3` reference implementation
+    to floating-point precision.
+    """
+    x = np.sort(np.asarray(x))
+    n = len(x)
+    i = np.arange(1, n + 1)
+    b0 = x.mean()
+    b1 = np.sum(((i - 1) / (n - 1)) * x) / n
+    l1, l2 = b0, 2 * b1 - b0
+    scale = l2 / np.log(2)
+    loc = l1 - np.euler_gamma * scale
+    return loc, scale
+
+
 def fit_pot(
     values: np.ndarray,
     n_years: int,
@@ -334,9 +354,10 @@ def fit_pot(
     given rate_mode. See the module docstring.
 
     dist:
-      "gumbel" -- plain (unconditional) Gumbel MLE fit to the raw
-                  exceedance values. What was originally asked for here;
-                  an approximation (see module docstring caveat).
+      "gumbel" -- plain (unconditional) Gumbel fit (L-moments, not MLE --
+                  see _fit_gumbel_lmoments) to the raw exceedance values.
+                  What was originally asked for here; an approximation
+                  (see module docstring caveat).
       "gpd"    -- textbook peaks-over-threshold model: a generalized
                   Pareto fit (via MLE, location fixed at 0) to the
                   exceedances *above* the threshold (values - threshold).
@@ -359,8 +380,8 @@ def fit_pot(
     fit depends on that one exceedance.
 
     Unlike empirical_tail_slope's drop_extreme, there's no separate
-    "recompute vs. leave-one-out" choice to make here: an MLE fit (both
-    dist options) fits directly to the raw exceedance values, with no
+    "recompute vs. leave-one-out" choice to make here: both dist options
+    fit directly to the raw exceedance values, with no
     rank-derived plotting positions in the loop that would need
     recomputing for the smaller sample -- dropping a point and refitting
     already *is* the leave-one-out operation. See
@@ -396,7 +417,7 @@ def fit_pot(
         raise ValueError(f"unknown rate_mode: {rate_mode!r}")
 
     if dist == "gumbel":
-        loc, scale = gumbel_r.fit(exceed)
+        loc, scale = _fit_gumbel_lmoments(exceed)
         params = {"loc": loc, "scale": scale}
     elif dist == "gpd":
         c, loc, scale = genpareto.fit(exceed - threshold, floc=0)
@@ -448,7 +469,7 @@ def fit_block_maxima(values: np.ndarray, years: np.ndarray, dist: str = "gumbel"
     n_years = len(uniq_years)
 
     if dist == "gumbel":
-        loc, scale = gumbel_r.fit(block_max)
+        loc, scale = _fit_gumbel_lmoments(block_max)
         params = {"loc": loc, "scale": scale}
     elif dist == "gev":
         c, loc, scale = genextreme.fit(block_max)
@@ -600,7 +621,7 @@ def bootstrap_return_level_ci_block_maxima(
         sample = rng.choice(block_max_values, size=n, replace=True)
         try:
             if dist == "gumbel":
-                loc, scale = gumbel_r.fit(sample)
+                loc, scale = _fit_gumbel_lmoments(sample)
                 params = {"loc": loc, "scale": scale}
             else:
                 c, loc, scale = genextreme.fit(sample)
@@ -629,6 +650,7 @@ def plot_return_periods(
     fit_era5_block_maxima: dict = None,
     era5_block_maxima_values: np.ndarray = None,
     block_maxima_label: str = None,
+    cmip_fits: dict = None,
     reference_value: float = None,
     reference_label: str = None,
     xscale: str = "log",
@@ -652,25 +674,43 @@ def plot_return_periods(
     to one maximum per year (era5_block_maxima_values must be the block
     maxima array itself, for bootstrapping).
 
+    cmip_fits (optional): {model_name: {"fit": fit_dict, "values": ndarray}},
+    one entry per CMIP model (see fit_pot) -- shown as empirical (Weibull
+    plotting-position) points only, no fitted Gumbel curve/CI band/
+    reference-crossing extrapolation. Individual CMIP-model POT samples
+    are small (comparable to ERA5's own m~11), so extrapolating a
+    per-model fit out to reference_value-class return periods would be
+    exactly the kind of unstable, easily-misread extrapolation this whole
+    analysis is trying to avoid -- the point of adding CMIP here is to
+    see where each model's actual observed tail sits, not to manufacture
+    a return-period number for it. Styled via MODEL_COLORS'
+    cmip_model_1, cmip_model_2, ... slots (dimmer alpha by default so
+    they don't visually compete with ERA5/reforecast).
+
     reference_value (optional): draws a horizontal line (e.g. the 2021 PNW
     heatwave's observed peak) and marks/annotates the return period each
     fitted curve implies for it.
     """
-    curves = [(fit_era5, era5_values, COL["era5"], COL["era5_ci"], "-", "ERA5")]
+    curves = [
+        {"fit": fit_era5, "values": era5_values, "color": COL["era5"], "ci": COL["era5_ci"],
+         "linestyle": "-", "label": "ERA5", "marker": "^", "alpha": 1.0, "show_empirical": True, "show_fit": True},
+    ]
     if fit_era5_sensitivity is not None:
-        curves.append(
-            (fit_era5_sensitivity, era5_sensitivity_values, COL["era5"], "#cccccc", ":",
-             sensitivity_label or "ERA5 (sensitivity)")
-        )
+        curves.append({"fit": fit_era5_sensitivity, "values": era5_sensitivity_values, "color": COL["era5"],
+                        "ci": "#cccccc", "linestyle": ":", "label": sensitivity_label or "ERA5 (sensitivity)",
+                        "marker": "^", "alpha": 1.0, "show_empirical": False, "show_fit": True})
     if fit_era5_block_maxima is not None:
-        curves.append(
-            (fit_era5_block_maxima, era5_block_maxima_values, "#8c564b", "#c49c94", "-.",
-             block_maxima_label or "ERA5 (block maxima)")
-        )
-    curves.append(
-        (fit_rf, rf_values, COL["reforecast"], COL["reforecast_ci"], "--",
-         f"Reforecast day {lead_day}")
-    )
+        curves.append({"fit": fit_era5_block_maxima, "values": era5_block_maxima_values, "color": "#8c564b",
+                        "ci": "#c49c94", "linestyle": "-.", "label": block_maxima_label or "ERA5 (block maxima)",
+                        "marker": "^", "alpha": 1.0, "show_empirical": False, "show_fit": True})
+    curves.append({"fit": fit_rf, "values": rf_values, "color": COL["reforecast"], "ci": COL["reforecast_ci"],
+                    "linestyle": "--", "label": f"Reforecast day {lead_day}", "marker": "o", "alpha": 1.0,
+                    "show_empirical": True, "show_fit": True})
+    for i, (name, entry) in enumerate(dict(cmip_fits or {}).items(), start=1):
+        style = MODEL_COLORS.get(f"cmip_model_{i}", MODEL_COLORS["cmip_model_1"])
+        curves.append({"fit": entry["fit"], "values": entry["values"], "color": style["color"], "ci": style["ci"],
+                        "linestyle": "-", "label": name, "marker": style.get("marker", "o"),
+                        "alpha": style.get("alpha", 0.55), "show_empirical": True, "show_fit": False})
 
     # Extend the return-period axis far enough to show every curve's
     # crossing of reference_value on-chart, up to a sanity cap (curves that
@@ -682,9 +722,7 @@ def plot_return_periods(
     AXIS_EXTENSION_CAP = 1e6
     T_max_plot = RETURN_PERIODS_PLOT.max()
     if reference_value is not None:
-        finite_T_ref = [
-            return_period_for_value(fit, reference_value) for fit, *_ in curves
-        ]
+        finite_T_ref = [return_period_for_value(c["fit"], reference_value) for c in curves if c["show_fit"]]
         in_range = [t for t in finite_T_ref if np.isfinite(t) and t <= AXIS_EXTENSION_CAP]
         if in_range:
             T_max_plot = max(T_max_plot, max(in_range) * 1.3)
@@ -692,34 +730,34 @@ def plot_return_periods(
 
     fig, ax = plt.subplots(figsize=(7.2, 4.8))
 
-    for fit, values, _, ci_color, _, _ in curves:
+    for c in curves:
+        if not c["show_fit"]:
+            continue
+        fit = c["fit"]
         if fit["rate_mode"] == "block_maxima":
-            lower, upper = bootstrap_return_level_ci_block_maxima(values, fit["dist"], T_fit)
+            lower, upper = bootstrap_return_level_ci_block_maxima(c["values"], fit["dist"], T_fit)
         else:
             lower, upper = bootstrap_return_level_ci(
-                values, fit["n_years"], fit["n_members"], fit["rate_mode"], T_fit, dist=fit["dist"],
+                c["values"], fit["n_years"], fit["n_members"], fit["rate_mode"], T_fit, dist=fit["dist"],
                 drop_extreme=fit.get("drop_extreme"),
             )
-        ax.fill_between(T_fit, lower, upper, color=ci_color, alpha=0.6, linewidth=0, zorder=1)
+        ax.fill_between(T_fit, lower, upper, color=c["ci"], alpha=0.6 * c["alpha"], linewidth=0, zorder=1)
 
-    T_emp_era5, x_emp_era5 = empirical_return_periods(fit_era5)
-    T_emp_rf, x_emp_rf = empirical_return_periods(fit_rf)
-
-    ax.scatter(
-        T_emp_era5, x_emp_era5, s=16, color=COL["era5"], marker="^",
-        label="ERA5 (empirical)", zorder=3,
-    )
-    ax.scatter(
-        T_emp_rf, x_emp_rf, s=10, color=COL["reforecast"], marker="o", alpha=0.5,
-        label=f"Reforecast day {lead_day} (empirical)", zorder=2,
-    )
+    for c in curves:
+        if not c["show_empirical"]:
+            continue
+        T_emp, x_emp = empirical_return_periods(c["fit"])
+        ax.scatter(T_emp, x_emp, s=12, color=c["color"], marker=c["marker"], alpha=0.6 * c["alpha"],
+                    label=f"{c['label']} (empirical)", zorder=3)
 
     dist_label = {"gumbel": "Gumbel", "gpd": "GPD", "gev": "GEV"}
-    for fit, _, color, _, linestyle, label in curves:
+    for c in curves:
+        if not c["show_fit"]:
+            continue
         ax.plot(
-            T_fit, fitted_return_levels(fit, T_fit), color=color,
-            linewidth=1.4, linestyle=linestyle,
-            label=f"{label} ({dist_label[fit['dist']]} fit)", zorder=4,
+            T_fit, fitted_return_levels(c["fit"], T_fit), color=c["color"],
+            linewidth=1.4, linestyle=c["linestyle"], alpha=c["alpha"],
+            label=f"{c['label']} ({dist_label[c['fit']['dist']]} fit)", zorder=4,
         )
     ax.plot([], [], color=COL["reference"], alpha=0.25, linewidth=8,
             label=f"{int(CI_LEVEL * 100)}% bootstrap CI")
@@ -733,15 +771,17 @@ def plot_return_periods(
 
         ref_desc = reference_label or f"{reference_value:g}"
         lines = [f"Return period implied by {ref_desc}:"]
-        for fit, _, color, _, _, label in curves:
-            T_ref = return_period_for_value(fit, reference_value)
+        for c in curves:
+            if not c["show_fit"]:
+                continue
+            T_ref = return_period_for_value(c["fit"], reference_value)
             if np.isfinite(T_ref) and T_ref <= T_fit.max():
-                ax.scatter([T_ref], [reference_value], color=color, marker="x", s=45, zorder=6)
-                lines.append(f"{label}: {T_ref:,.0f} yr ({format_scientific(T_ref)} yr)")
+                ax.scatter([T_ref], [reference_value], color=c["color"], marker="x", s=45, zorder=6, alpha=c["alpha"])
+                lines.append(f"{c['label']}: {T_ref:,.0f} yr ({format_scientific(T_ref)} yr)")
             elif np.isfinite(T_ref):
-                lines.append(f"{label}: {T_ref:,.0f} yr ({format_scientific(T_ref)} yr, off-chart)")
+                lines.append(f"{c['label']}: {T_ref:,.0f} yr ({format_scientific(T_ref)} yr, off-chart)")
             else:
-                lines.append(f"{label}: never (beyond fit's upper support)")
+                lines.append(f"{c['label']}: never (beyond fit's upper support)")
         ax.text(
             0.98, 0.03, "\n".join(lines), transform=ax.transAxes,
             fontsize=7, color=COL["reference"], ha="right", va="bottom",
@@ -1351,9 +1391,9 @@ def leave_one_out_return_level_sensitivity(
     number per excluded point.
 
     Unlike the empirical-slope version, there's only one way to do this
-    for an MLE fit -- see fit_pot's drop_extreme docstring for why
-    "recompute vs. leave-one-out" isn't a live question here the way it
-    is for empirical_tail_slope.
+    for a direct parametric fit -- see fit_pot's drop_extreme docstring
+    for why "recompute vs. leave-one-out" isn't a live question here the
+    way it is for empirical_tail_slope.
     """
     values = np.asarray(values)
     fit_full = fit_pot(values, n_years, n_members, rate_mode, dist=dist)
@@ -1440,8 +1480,8 @@ def parse_args():
     )
     p.add_argument(
         "--dist", default="gumbel", choices=["gumbel", "gpd"],
-        help="gumbel: unconditional Gumbel MLE fit to the top 5%% (as originally asked). "
-             "gpd: textbook POT model, generalized Pareto fit to the threshold exceedances.",
+        help="gumbel: unconditional Gumbel fit (L-moments) to the top 5%% (as originally asked). "
+             "gpd: textbook POT model, generalized Pareto fit (MLE) to the threshold exceedances.",
     )
     p.add_argument("--out-prefix", default=None, help="directory/prefix for outputs")
     p.add_argument(
@@ -1648,12 +1688,27 @@ def main():
             else:
                 print(f"  {label}: never (below fit support)")
 
+    cmip_values = {}
+    cmip_fits = {}
+    if args.cmip_models:
+        if not args.cmip_datatree_path:
+            raise ValueError("--cmip-models requires --cmip-datatree-path")
+        cmip_dtree = xr.open_datatree(args.cmip_datatree_path)
+        for model_name in [m.strip() for m in args.cmip_models.split(",") if m.strip()]:
+            cmip_df = load_cmip_model(cmip_dtree, model_name, target_mmdd, var=args.cmip_var)
+            values = cmip_df["value"].values
+            n_years_cmip = cmip_df["year"].nunique()
+            cmip_values[model_name] = values
+            cmip_fits[model_name] = {"fit": fit_pot(values, n_years_cmip), "values": values}
+            print(f"Loaded CMIP model {model_name}: n={len(cmip_df)}, n_years={n_years_cmip}")
+
     fig = plot_return_periods(
         fit_era5, fit_rf, era5_values, rf_values, args.lead_day,
         fit_era5_sensitivity=fit_era5_sens, era5_sensitivity_values=era5_values,
         sensitivity_label=sens_label,
         fit_era5_block_maxima=fit_era5_bm, era5_block_maxima_values=era5_bm_values,
         block_maxima_label=bm_label,
+        cmip_fits=cmip_fits,
         reference_value=args.reference_value, reference_label=args.reference_label,
     )
     fig.savefig(f"{out_base}.pdf")
@@ -1661,16 +1716,6 @@ def main():
     print(f"\nSaved -> {out_csv}, {out_base}.pdf, {out_base}.png")
 
     if args.empirical_slope_plot:
-        cmip_values = {}
-        if args.cmip_models:
-            if not args.cmip_datatree_path:
-                raise ValueError("--cmip-models requires --cmip-datatree-path")
-            cmip_dtree = xr.open_datatree(args.cmip_datatree_path)
-            for model_name in [m.strip() for m in args.cmip_models.split(",") if m.strip()]:
-                cmip_df = load_cmip_model(cmip_dtree, model_name, target_mmdd, var=args.cmip_var)
-                cmip_values[model_name] = cmip_df["value"].values
-                print(f"Loaded CMIP model {model_name}: n={len(cmip_df)}")
-
         rf_label = f"Reforecast day {args.lead_day}"
         era5_excl_max_label = sens_label or "ERA5 (excl. max)"
         all_datasets = collect_empirical_slope_datasets(
