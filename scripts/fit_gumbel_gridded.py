@@ -437,62 +437,45 @@ def plot_all_region_maps(regions: dict = REGIONS, model_files: dict = None,
 
 # ── UK regions (shapefile clip) ─────────────────────────────────────────────
 
-def load_uk_regions(shapefile_path: str = UK_SHAPEFILE_PATH, name_col: str = "RGN23NM"):
+def load_uk_regions(shapefile_path: str = UK_SHAPEFILE_PATH):
     """
-    Reads the ONS regions shapefile with pyshp + shapely + pyproj (pip install pyshp) instead of
-    geopandas -- geopandas pulls in a much larger, more fragile compiled dependency chain
-    (GEOS/GDAL/fiona/pyogrio) that's a common source of shapely/geopandas ABI mismatches on
-    cluster conda envs, whereas pyshp is pure Python and only needs shapely (already a
-    scipy/xarray-stack dependency) and pyproj (already needed for any CRS-aware work here).
-    Reprojects to EPSG:4326 using the shapefile's own .prj sidecar if it isn't already WGS84 --
-    ONS boundary files are commonly delivered in EPSG:27700 (British National Grid), which is
-    metres, not degrees, and would silently break every lon/lat comparison below. Returns a
-    regionmask.Regions object (not a GeoDataFrame) -- used directly by uk_bounds/mask_to_regions/
-    plot_uk_map below via its own .bounds_global/.mask()/.plot_regions() API. overlap=False since
-    admin regions are disjoint by construction -- without it, .mask() can raise "Found
-    overlapping regions" on some grids (regionmask's overlap autodetection is a per-gridpoint
-    check done lazily inside .mask(), not a pure geometry check, so whether it triggers can
-    depend on grid resolution even for genuinely non-overlapping polygons).
+    Reads the ONS regions shapefile (pip install geopandas) and reprojects to EPSG:4326 if it
+    isn't already -- ONS boundary files are commonly delivered in EPSG:27700 (British National
+    Grid), which is metres, not degrees, and would silently break every lon/lat comparison below.
     """
-    import shapefile  # pyshp
-    from shapely.geometry import shape
-    import regionmask
-
-    sf = shapefile.Reader(shapefile_path)
-    fields = [f[0] for f in sf.fields[1:]]  # sf.fields[0] is the DeletionFlag pseudo-field
-    name_idx = fields.index(name_col) if name_col in fields else 0
-    geoms = [shape(s.__geo_interface__) for s in sf.shapes()]
-    names = [r[name_idx] for r in sf.records()]
-
-    prj_path = os.path.splitext(shapefile_path)[0] + ".prj"
-    if os.path.exists(prj_path):
-        import pyproj
-        from shapely.ops import transform
-        crs = pyproj.CRS.from_wkt(open(prj_path).read())
-        if crs.to_epsg() != 4326:
-            transformer = pyproj.Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-            geoms = [transform(transformer.transform, g) for g in geoms]
-
-    return regionmask.Regions(geoms, names=names, name="UK regions", overlap=False)
+    import geopandas as gpd
+    gdf = gpd.read_file(shapefile_path)
+    if gdf.crs is not None and gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
+    return gdf
 
 
 def uk_bounds(uk_regions, pad: float = 0.5):
-    """(lat_bounds, lon_bounds) from a regionmask.Regions' global bounding box, padded by `pad`
+    """(lat_bounds, lon_bounds) from a regions GeoDataFrame's total bounding box, padded by `pad`
     degrees so the select_box crop below doesn't clip cells sitting right at the boundary edge --
     same (lat_bounds, lon_bounds) format REGIONS/select_box/box_mean already use."""
-    minx, miny, maxx, maxy = uk_regions.bounds_global
+    minx, miny, maxx, maxy = uk_regions.total_bounds
     return (miny - pad, maxy + pad), (minx - pad, maxx + pad)
 
 
 def mask_to_regions(da: xr.DataArray, uk_regions) -> xr.DataArray:
     """
     Mask out every cell whose center falls outside every polygon in `uk_regions`, via
-    regionmask.Regions.mask() -- the same cell-center membership test mask_ocean already uses
+    regionmask.mask_geopandas -- the same cell-center membership test mask_ocean already uses
     against the Natural Earth land polygon, just region polygons here instead of a coastline.
     Handles both -180..180 and 0..360 longitude conventions natively (regionmask reads da['lon']
-    directly), so it works whether or not to_180_lon has already been applied.
+    directly), so it works whether or not to_180_lon has already been applied. overlap=False
+    since admin regions are disjoint by construction -- without it, mask_geopandas can raise
+    "Found overlapping regions" on some grids (regionmask's overlap autodetection is a
+    per-gridpoint check done lazily during masking, not a pure geometry check, so whether it
+    triggers can depend on grid resolution even for genuinely non-overlapping polygons).
     """
-    mask = uk_regions.mask(da["lon"], da["lat"])
+    try:
+        import regionmask
+    except ImportError as e:
+        raise ImportError("mask_to_regions() requires the 'regionmask' package (pip install "
+                           "regionmask).") from e
+    mask = regionmask.mask_geopandas(uk_regions, da["lon"], da["lat"], overlap=False)
     return da.where(np.isfinite(mask))
 
 
@@ -503,9 +486,8 @@ def plot_uk_map(out: xr.Dataset, uk_regions, field: str = "rarity_factor_per_plu
     Same rendering as plot_tail_slope_map, but clipped to the UK instead of the whole globe:
     cropped to the shapefile's bounding box (region_pad degrees of margin) and masked to NaN
     outside every region polygon (mask_to_regions), rather than ocean-masked land everywhere.
-    Draws the region boundaries themselves on top via regionmask's own plot_regions() (works on
-    both a plain matplotlib Axes and a cartopy GeoAxes) instead of generic coastline/borders,
-    since the point here is the English admin regions, not the coastline.
+    Draws the region boundaries themselves on top instead of generic coastline/borders, since the
+    point here is the English admin regions, not the coastline.
     """
     lat_bounds, lon_bounds = uk_bounds(uk_regions, pad=region_pad)
     da = select_box(out, lat_bounds, lon_bounds)[field].compute()
@@ -515,14 +497,15 @@ def plot_uk_map(out: xr.Dataset, uk_regions, field: str = "rarity_factor_per_plu
     cmap_obj = plt.get_cmap(cmap, n_levels + 2)  # +2 colors for extend="both" (below-min, above-max bins)
     norm = BoundaryNorm(levels, ncolors=cmap_obj.N, extend="both")
     tick_labels = [f"{x:.2g}" for x in levels]
-    minx, miny, maxx, maxy = uk_regions.bounds_global
+    minx, miny, maxx, maxy = uk_regions.total_bounds
 
     if HAS_CARTOPY:
         proj = ccrs.PlateCarree()
         fig, ax = plt.subplots(figsize=(6, 7), subplot_kw={"projection": proj})
         mesh = da.plot.pcolormesh(ax=ax, transform=ccrs.PlateCarree(), norm=norm, cmap=cmap_obj,
                                    add_colorbar=False, shading="auto", rasterized=True)
-        uk_regions.plot_regions(ax=ax, add_label=False, line_kws=dict(color="black", linewidth=0.6))
+        ax.add_geometries(uk_regions.geometry, crs=ccrs.PlateCarree(), facecolor="none",
+                           edgecolor="black", linewidth=0.6)
         ax.set_extent([minx - region_pad, maxx + region_pad, miny - region_pad, maxy + region_pad],
                        crs=ccrs.PlateCarree())
         gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.4)
@@ -538,7 +521,7 @@ def plot_uk_map(out: xr.Dataset, uk_regions, field: str = "rarity_factor_per_plu
     else:
         fig, ax = plt.subplots(figsize=(6, 7))
         mesh = ax.pcolormesh(da["lon"], da["lat"], da, cmap=cmap_obj, norm=norm, shading="auto")
-        uk_regions.plot_regions(ax=ax, add_label=False, line_kws=dict(color="black", linewidth=0.6))
+        uk_regions.boundary.plot(ax=ax, color="black", linewidth=0.6)
         ax.set_xlim(minx - region_pad, maxx + region_pad)
         ax.set_ylim(miny - region_pad, maxy + region_pad)
         fig.colorbar(mesh, ax=ax, label=field, shrink=0.85, ticks=levels,
