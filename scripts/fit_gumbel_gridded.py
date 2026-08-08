@@ -78,6 +78,15 @@ REGIONS = {
     "Siberia": ((60, 68), (90, 120)),        # subarctic/continental -- cold-dominated, heat is not the norm here
 }
 
+# ONS "Regions (December 2023) Boundaries EN BFC" shapefile directory -- the .shp plus its
+# .shx/.dbf/.prj siblings must all be present alongside it. Point this at wherever it actually
+# lives on your cluster.
+UK_SHAPEFILE_PATH = (
+    "/network/group/aopp/predict/AWH020_AYIM_EXTREME/shapefiles/"
+    "Regions_December_2023_Boundaries_EN_BFC_117415587253983129/"
+    "RGN_DEC_2023_EN_BFC.shp"
+)
+
 plt.rcParams.update({
     "font.family": "serif", "font.serif": ["Times New Roman", "DejaVu Serif"], "font.size": 9,
     "axes.labelsize": 9, "axes.titlesize": 9, "xtick.labelsize": 8, "ytick.labelsize": 8,
@@ -158,14 +167,33 @@ def select_box(out: xr.Dataset, lat_bounds=CMIP_LAT_BOUNDS, lon_bounds=CMIP_LON_
     ERA5's -- otherwise -123..-119 silently selects zero cells there) and either latitude
     ordering (ascending like CMIP, or descending like ERA5/reforecast). Raises instead of
     silently returning an empty selection.
+
+    Also handles boxes that straddle the prime meridian (e.g. the UK: -6..2) on a native 0..360
+    grid: converting -6..2 to 0..360 gives 354..2, where a single ascending .sel(lon=slice(...))
+    would silently select almost the entire globe instead of the small wedge intended (the
+    complement of what was wanted), since 354 > 2 makes min/max pick the wrong pair of endpoints.
+    Detected via lon_lo > lon_hi after the 0..360 conversion and handled by selecting the two
+    wedges either side of the seam (354..360 and 0..2) and concatenating them.
     """
     lat_lo, lat_hi = lat_bounds
     lon_lo, lon_hi = lon_bounds
+    wraps = False
     if float(out["lon"].min()) >= 0:
         lon_lo, lon_hi = lon_lo % 360, lon_hi % 360
-    box = out.sel(lat=slice(min(lat_lo, lat_hi), max(lat_lo, lat_hi)), lon=slice(min(lon_lo, lon_hi), max(lon_lo, lon_hi)))
-    if box.sizes.get("lat", 0) == 0:
-        box = out.sel(lat=slice(max(lat_lo, lat_hi), min(lat_lo, lat_hi)), lon=slice(min(lon_lo, lon_hi), max(lon_lo, lon_hi)))
+        wraps = lon_lo > lon_hi
+
+    def _lat_sel(ds):
+        b = ds.sel(lat=slice(min(lat_lo, lat_hi), max(lat_lo, lat_hi)))
+        if b.sizes.get("lat", 0) == 0:
+            b = ds.sel(lat=slice(max(lat_lo, lat_hi), min(lat_lo, lat_hi)))
+        return b
+
+    if wraps:
+        lat_sel = _lat_sel(out)
+        box = xr.concat([lat_sel.sel(lon=slice(lon_lo, 360)), lat_sel.sel(lon=slice(0, lon_hi))], dim="lon")
+    else:
+        box = _lat_sel(out).sel(lon=slice(min(lon_lo, lon_hi), max(lon_lo, lon_hi)))
+
     if box.sizes.get("lat", 0) == 0 or box.sizes.get("lon", 0) == 0:
         raise ValueError(f"box selection is empty (lat={lat_bounds}, lon={lon_bounds} -> "
                           f"resolved to lon={lon_lo, lon_hi}) -- check the grid's lat/lon convention")
@@ -407,6 +435,123 @@ def plot_all_region_maps(regions: dict = REGIONS, model_files: dict = None,
     return figs
 
 
+# ── UK regions (shapefile clip) ─────────────────────────────────────────────
+
+def load_uk_regions(shapefile_path: str = UK_SHAPEFILE_PATH):
+    """
+    Reads the ONS regions shapefile (pip install geopandas) and reprojects to EPSG:4326 if it
+    isn't already -- ONS boundary files are commonly delivered in EPSG:27700 (British National
+    Grid), which is metres, not degrees, and would silently break every lon/lat comparison below.
+    """
+    import geopandas as gpd
+    gdf = gpd.read_file(shapefile_path)
+    if gdf.crs is not None and gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
+    return gdf
+
+
+def uk_bounds(uk_regions, pad: float = 0.5):
+    """(lat_bounds, lon_bounds) from a regions GeoDataFrame's total bounding box, padded by `pad`
+    degrees so the select_box crop below doesn't clip cells sitting right at the boundary edge --
+    same (lat_bounds, lon_bounds) format REGIONS/select_box/box_mean already use."""
+    minx, miny, maxx, maxy = uk_regions.total_bounds
+    return (miny - pad, maxy + pad), (minx - pad, maxx + pad)
+
+
+def mask_to_regions(da: xr.DataArray, uk_regions) -> xr.DataArray:
+    """
+    Mask out every cell whose center falls outside every polygon in `uk_regions`, via
+    regionmask.mask_geopandas -- the same cell-center membership test mask_ocean already uses
+    against the Natural Earth land polygon, just region polygons here instead of a coastline.
+    Handles both -180..180 and 0..360 longitude conventions natively (regionmask reads da['lon']
+    directly), so it works whether or not to_180_lon has already been applied. overlap=False
+    since admin regions are disjoint by construction -- lets regionmask skip its (expensive,
+    unnecessary here) overlap-ambiguity check.
+    """
+    try:
+        import regionmask
+    except ImportError as e:
+        raise ImportError("mask_to_regions() requires the 'regionmask' package (pip install "
+                           "regionmask).") from e
+    mask = regionmask.mask_geopandas(uk_regions, da["lon"], da["lat"], overlap=False)
+    return da.where(np.isfinite(mask))
+
+
+def plot_uk_map(out: xr.Dataset, uk_regions, field: str = "rarity_factor_per_plus1degC",
+                 cmap: str = "viridis", title: str = None, vmin=None, vmax=None,
+                 n_levels: int = 10, region_pad: float = 0.5):
+    """
+    Same rendering as plot_tail_slope_map, but clipped to the UK instead of the whole globe:
+    cropped to the shapefile's bounding box (region_pad degrees of margin) and masked to NaN
+    outside every region polygon (mask_to_regions), rather than ocean-masked land everywhere.
+    Draws the region boundaries themselves on top instead of generic coastline/borders, since the
+    point here is the English admin regions, not the coastline.
+    """
+    lat_bounds, lon_bounds = uk_bounds(uk_regions, pad=region_pad)
+    da = select_box(out, lat_bounds, lon_bounds)[field].compute()
+    da = to_180_lon(da)
+    da = mask_to_regions(da, uk_regions)
+    levels = _discrete_log_levels(da, n_levels=n_levels, vmin=vmin, vmax=vmax)
+    cmap_obj = plt.get_cmap(cmap, n_levels + 2)  # +2 colors for extend="both" (below-min, above-max bins)
+    norm = BoundaryNorm(levels, ncolors=cmap_obj.N, extend="both")
+    tick_labels = [f"{x:.2g}" for x in levels]
+    minx, miny, maxx, maxy = uk_regions.total_bounds
+
+    if HAS_CARTOPY:
+        proj = ccrs.PlateCarree()
+        fig, ax = plt.subplots(figsize=(6, 7), subplot_kw={"projection": proj})
+        mesh = da.plot.pcolormesh(ax=ax, transform=ccrs.PlateCarree(), norm=norm, cmap=cmap_obj,
+                                   add_colorbar=False, shading="auto", rasterized=True)
+        ax.add_geometries(uk_regions.geometry, crs=ccrs.PlateCarree(), facecolor="none",
+                           edgecolor="black", linewidth=0.6)
+        ax.set_extent([minx - region_pad, maxx + region_pad, miny - region_pad, maxy + region_pad],
+                       crs=ccrs.PlateCarree())
+        gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.4)
+        gl.top_labels = False
+        gl.right_labels = False
+        gl.xlabel_style = {"size": 8}
+        gl.ylabel_style = {"size": 8}
+        cbar = fig.colorbar(mesh, ax=ax, orientation="vertical", extend="both", shrink=0.8)
+        cbar.set_ticks(levels)
+        cbar.ax.minorticks_off()
+        cbar.set_ticklabels(tick_labels)
+        cbar.set_label(field)
+    else:
+        fig, ax = plt.subplots(figsize=(6, 7))
+        mesh = ax.pcolormesh(da["lon"], da["lat"], da, cmap=cmap_obj, norm=norm, shading="auto")
+        uk_regions.boundary.plot(ax=ax, color="black", linewidth=0.6)
+        ax.set_xlim(minx - region_pad, maxx + region_pad)
+        ax.set_ylim(miny - region_pad, maxy + region_pad)
+        fig.colorbar(mesh, ax=ax, label=field, shrink=0.85, ticks=levels,
+                     format=lambda x, _: f"{x:.2g}")
+        ax.set_xlabel("lon")
+        ax.set_ylabel("lat")
+
+    ax.set_title(title or field)
+    return fig
+
+
+def plot_all_uk_maps(uk_regions=None, model_files: dict = None, field: str = "rarity_factor_per_plus1degC",
+                      out_prefix: str = OUT_PREFIX) -> dict:
+    """
+    One UK-clipped map per dataset (ERA5, Reforecast, each CMIP model, each AMIP model), saved as
+    {out_prefix}_uk_{dataset}.png. Reopens the already-saved global .nc files (no recompute) --
+    same reuse pattern as region_model_table/plot_all_region_maps.
+    """
+    if uk_regions is None:
+        uk_regions = load_uk_regions()
+    if model_files is None:
+        model_files = build_model_file_map()
+    figs = {}
+    for name, path in model_files.items():
+        ds = xr.open_dataset(path)
+        fig = plot_uk_map(ds, uk_regions, field=field, title=f"{name}: {field}")
+        safe_name = name.replace(" ", "_").replace("(", "").replace(")", "").replace(".", "")
+        fig.savefig(f"{out_prefix}_uk_{safe_name}.png")
+        figs[name] = fig
+    return figs
+
+
 # ── Data loading (global grid, no box selection) ────────────────────────────
 
 def compute_target_mmdd(refore_ds: xr.Dataset, lead_day: int, n_inidates: int = None):
@@ -565,6 +710,11 @@ def main():
     # Actual spatial maps per region (not just the averaged table above) -- one figure per
     # region, one subplot per model, so spatial patterns are visible, not just a single number
     plot_all_region_maps()
+
+    # UK regions (shapefile clip): one map per dataset, cropped and masked to the ONS English
+    # regions shapefile instead of a rectangular box
+    uk_regions = load_uk_regions()
+    plot_all_uk_maps(uk_regions)
 
     print("Done.")
 
