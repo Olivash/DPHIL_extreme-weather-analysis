@@ -448,7 +448,11 @@ def load_uk_regions(shapefile_path: str = UK_SHAPEFILE_PATH, name_col: str = "RG
     ONS boundary files are commonly delivered in EPSG:27700 (British National Grid), which is
     metres, not degrees, and would silently break every lon/lat comparison below. Returns a
     regionmask.Regions object (not a GeoDataFrame) -- used directly by uk_bounds/mask_to_regions/
-    plot_uk_map below via its own .bounds_global/.mask()/.plot_regions() API.
+    plot_uk_map below via its own .bounds_global/.mask()/.plot_regions() API. overlap=False since
+    admin regions are disjoint by construction -- without it, .mask() can raise "Found
+    overlapping regions" on some grids (regionmask's overlap autodetection is a per-gridpoint
+    check done lazily inside .mask(), not a pure geometry check, so whether it triggers can
+    depend on grid resolution even for genuinely non-overlapping polygons).
     """
     import shapefile  # pyshp
     from shapely.geometry import shape
@@ -469,7 +473,7 @@ def load_uk_regions(shapefile_path: str = UK_SHAPEFILE_PATH, name_col: str = "RG
             transformer = pyproj.Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
             geoms = [transform(transformer.transform, g) for g in geoms]
 
-    return regionmask.Regions(geoms, names=names, name="UK regions")
+    return regionmask.Regions(geoms, names=names, name="UK regions", overlap=False)
 
 
 def uk_bounds(uk_regions, pad: float = 0.5):
@@ -561,6 +565,39 @@ def plot_all_uk_maps(uk_regions=None, model_files: dict = None, field: str = "ra
     for name, path in model_files.items():
         ds = xr.open_dataset(path)
         fig = plot_uk_map(ds, uk_regions, field=field, title=f"{name}: {field}")
+        safe_name = name.replace(" ", "_").replace("(", "").replace(")", "").replace(".", "")
+        fig.savefig(f"{out_prefix}_uk_{safe_name}.png")
+        figs[name] = fig
+    return figs
+
+
+def build_uk_datatree(das: list, names: list, field: str = "rarity_factor_per_plus1degC") -> xr.DataTree:
+    """
+    Wraps an in-memory list of single-field DataArrays (e.g. already-loaded
+    rarity_factor_per_plus1degC grids for ERA5/Reforecast/each CMIP/AMIP model -- not reopened
+    from saved .nc files) into an xr.DataTree, one node per dataset. `names` must be aligned with
+    `das` by index (das[i]'s node is named names[i]). reset_coords(drop=True) strips any leftover
+    scalar metadata coords some sources carry (e.g. reforecast's 'experiment', CMIP/AMIP's
+    'height') -- same fix as the disagreement-hotspot MergeError elsewhere in this project -- so
+    nodes don't drag around inconsistent per-source coordinate baggage.
+    """
+    if len(das) != len(names):
+        raise ValueError(f"das ({len(das)}) and names ({len(names)}) must be the same length")
+    return xr.DataTree.from_dict({
+        name: xr.Dataset({field: da.reset_coords(drop=True)}) for name, da in zip(names, das)
+    })
+
+
+def plot_all_uk_maps_from_datatree(tree: xr.DataTree, uk_regions, field: str = "rarity_factor_per_plus1degC",
+                                    out_prefix: str = OUT_PREFIX) -> dict:
+    """
+    Same as plot_all_uk_maps, but walks an in-memory DataTree (see build_uk_datatree) instead of
+    reopening each dataset's saved .nc file by path -- for when the gridded output is already
+    loaded (e.g. as a list of DataArrays) rather than written to disk.
+    """
+    figs = {}
+    for name, node in tree.children.items():
+        fig = plot_uk_map(node.dataset, uk_regions, field=field, title=f"{name}: {field}")
         safe_name = name.replace(" ", "_").replace("(", "").replace(")", "").replace(".", "")
         fig.savefig(f"{out_prefix}_uk_{safe_name}.png")
         figs[name] = fig
